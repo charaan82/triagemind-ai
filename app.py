@@ -1,16 +1,17 @@
 import os
+import re
 import json
-import tempfile
+import pickle
+import sqlite3
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-import triagemind_engine as engine
-
 
 # ============================================================
-# PAGE CONFIGURATION
+# TRIAGEMIND AI
 # ============================================================
 
 st.set_page_config(
@@ -25,42 +26,44 @@ st.set_page_config(
 # PATHS
 # ============================================================
 
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MODEL_DIR = os.path.join(BASE_DIR, "model")
+MITRE_DIR = os.path.join(BASE_DIR, "mitre_data")
+
+CLASSIFIER_PATH = os.path.join(
+    MODEL_DIR,
+    "classifier.pkl"
 )
 
-MODEL_DIR = os.path.join(
+FEATURE_PATH = os.path.join(
+    MODEL_DIR,
+    "feature_columns.pkl"
+)
+
+MITRE_FILES = [
+    os.path.join(
+        MITRE_DIR,
+        "enterprise-attack.json"
+    ),
+    os.path.join(
+        MITRE_DIR,
+        "enterprise-attack-19.2.json"
+    ),
+    os.path.join(
+        MITRE_DIR,
+        "mitre_techniques.json"
+    )
+]
+
+DB_PATH = os.path.join(
     BASE_DIR,
-    "model"
-)
-
-MITRE_DIR = os.path.join(
-    BASE_DIR,
-    "mitre_data"
-)
-
-MITRE_FILE = os.path.join(
-    MITRE_DIR,
-    "enterprise-attack.json"
+    "triagemind_history.db"
 )
 
 
 # ============================================================
-# SESSION STATE
-# ============================================================
-
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "last_alert" not in st.session_state:
-    st.session_state.last_alert = None
-
-if "last_network" not in st.session_state:
-    st.session_state.last_network = None
-
-
-# ============================================================
-# CUSTOM CSS
+# PAGE STYLE
 # ============================================================
 
 st.markdown(
@@ -70,30 +73,36 @@ st.markdown(
     .block-container {
         padding-top: 1.5rem;
         padding-bottom: 2rem;
-        max-width: 1450px;
     }
 
     .hero {
-        padding: 28px;
+        padding: 25px;
         border-radius: 18px;
-        background: linear-gradient(
+        background:
+        linear-gradient(
             135deg,
-            #0f172a,
-            #172554
+            #111827,
+            #1f2937
         );
-        border: 1px solid #334155;
-        margin-bottom: 20px;
+        border: 1px solid #374151;
+        margin-bottom: 25px;
     }
 
     .hero h1 {
-        color: white;
-        font-size: 38px;
-        margin: 0;
+        margin-bottom: 5px;
     }
 
-    .hero p {
-        color: #cbd5e1;
-        margin: 6px 0;
+    .attack-card {
+        padding: 18px;
+        border-radius: 14px;
+        border: 1px solid #374151;
+        background: #111827;
+        margin-bottom: 12px;
+    }
+
+    .small-text {
+        color: #9ca3af;
+        font-size: 0.9rem;
     }
 
     </style>
@@ -103,37 +112,184 @@ st.markdown(
 
 
 # ============================================================
-# ENGINE FUNCTION ACCESS
+# DATABASE
 # ============================================================
 
-def get_engine_function(name):
+def init_database():
 
-    return getattr(
-        engine,
-        name,
-        None
+    conn = sqlite3.connect(DB_PATH)
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS investigations (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            timestamp TEXT,
+
+            prediction TEXT,
+
+            probability REAL,
+
+            severity TEXT,
+
+            risk_score INTEGER,
+
+            mitre_ids TEXT,
+
+            analyst TEXT,
+
+            notes TEXT,
+
+            source TEXT
+
+        )
+        """
     )
 
+    conn.commit()
+    conn.close()
 
-load_classifier = get_engine_function(
-    "load_classifier"
-)
 
-load_faiss = get_engine_function(
-    "load_faiss"
-)
+def save_investigation(
+    result,
+    analyst,
+    notes,
+    source
+):
 
-load_embedding_model = get_engine_function(
-    "load_embedding_model"
-)
+    conn = sqlite3.connect(DB_PATH)
 
-search_mitre_engine = get_engine_function(
-    "search_mitre"
-)
+    conn.execute(
+        """
+        INSERT INTO investigations
+        (
+            timestamp,
+            prediction,
+            probability,
+            severity,
+            risk_score,
+            mitre_ids,
+            analyst,
+            notes,
+            source
+        )
 
-classify_csv = get_engine_function(
-    "classify_csv"
-)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now().isoformat(
+                timespec="seconds"
+            ),
+
+            result.get(
+                "prediction",
+                ""
+            ),
+
+            float(
+                result.get(
+                    "probability",
+                    0
+                )
+            ),
+
+            result.get(
+                "severity",
+                ""
+            ),
+
+            int(
+                result.get(
+                    "risk_score",
+                    0
+                )
+            ),
+
+            json.dumps(
+                result.get(
+                    "mitre_ids",
+                    []
+                )
+            ),
+
+            analyst,
+
+            notes,
+
+            source
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def load_history():
+
+    conn = sqlite3.connect(DB_PATH)
+
+    df = pd.read_sql_query(
+        """
+        SELECT *
+        FROM investigations
+        ORDER BY id DESC
+        LIMIT 100
+        """,
+        conn
+    )
+
+    conn.close()
+
+    return df
+
+
+init_database()
+
+
+# ============================================================
+# INPUT SANITIZATION
+# ============================================================
+
+def sanitize_text(text):
+
+    if text is None:
+        return ""
+
+    text = str(text)
+
+    text = re.sub(
+        r"[\x00-\x08\x0b\x0c\x0e-\x1f]",
+        " ",
+        text
+    )
+
+    dangerous_patterns = [
+
+        r"ignore\s+(all\s+)?previous\s+instructions",
+
+        r"disregard\s+(all\s+)?previous",
+
+        r"system\s+prompt",
+
+        r"developer\s+message",
+
+        r"reveal\s+your\s+instructions",
+
+        r"jailbreak"
+
+    ]
+
+    for pattern in dangerous_patterns:
+
+        text = re.sub(
+            pattern,
+            "[SANITIZED]",
+            text,
+            flags=re.IGNORECASE
+        )
+
+    return text[:5000]
 
 
 # ============================================================
@@ -141,643 +297,1166 @@ classify_csv = get_engine_function(
 # ============================================================
 
 @st.cache_resource
-def load_model_safely():
+def load_model():
 
-    if load_classifier is None:
+    if not os.path.exists(
+        CLASSIFIER_PATH
+    ):
+        return None, None, (
+            "classifier.pkl not found"
+        )
 
-        return None, []
+    if not os.path.exists(
+        FEATURE_PATH
+    ):
+        return None, None, (
+            "feature_columns.pkl not found"
+        )
 
     try:
 
-        result = load_classifier()
+        with open(
+            CLASSIFIER_PATH,
+            "rb"
+        ) as file:
 
-        classifier = None
-        feature_columns = []
+            classifier = pickle.load(
+                file
+            )
 
-        # --------------------------------------------
-        # Case 1: Function returns tuple/list
-        # --------------------------------------------
+        with open(
+            FEATURE_PATH,
+            "rb"
+        ) as file:
+
+            feature_columns = pickle.load(
+                file
+            )
 
         if isinstance(
-            result,
-            (tuple, list)
+            feature_columns,
+            np.ndarray
         ):
 
-            if len(result) > 0:
+            feature_columns = (
+                feature_columns.tolist()
+            )
 
-                classifier = result[0]
+        if isinstance(
+            feature_columns,
+            dict
+        ):
 
-            # Search all remaining returned values
-            # for feature columns.
-            for value in result[1:]:
+            for key in [
+                "feature_columns",
+                "features",
+                "columns",
+                "feature_names"
+            ]:
 
-                if isinstance(
-                    value,
-                    (list, tuple)
-                ):
+                if key in feature_columns:
 
-                    feature_columns = list(
-                        value
+                    feature_columns = (
+                        feature_columns[key]
                     )
 
                     break
 
-                if hasattr(
-                    value,
-                    "tolist"
-                ):
-
-                    try:
-
-                        converted = value.tolist()
-
-                        if isinstance(
-                            converted,
-                            list
-                        ):
-
-                            feature_columns = converted
-
-                            break
-
-                    except Exception:
-                        pass
-
-        # --------------------------------------------
-        # Case 2: Function returns only model
-        # --------------------------------------------
-
-        else:
-
-            classifier = result
+        feature_columns = list(
+            feature_columns
+        )
 
         return (
             classifier,
-            feature_columns
+            feature_columns,
+            None
         )
 
     except Exception as error:
 
-        st.error(
-            "Unable to load the ML model."
-        )
-
-        st.code(
+        return (
+            None,
+            None,
             str(error)
         )
 
-        return (
-            None,
-            []
-        )
 
-
-classifier, feature_columns = load_model_safely()
+classifier, feature_columns, model_error = (
+    load_model()
+)
 
 
 # ============================================================
-# FAISS LOADING
+# MITRE ATT&CK LOADING
 # ============================================================
 
-@st.cache_resource
-def load_faiss_safely():
+def find_mitre_file():
 
-    if load_faiss is None:
+    for file_path in MITRE_FILES:
 
-        return None
+        if os.path.exists(
+            file_path
+        ):
 
-    try:
+            return file_path
 
-        return load_faiss()
+    return None
 
-    except Exception:
-
-        return None
-
-
-faiss_index = load_faiss_safely()
-
-
-# ============================================================
-# EMBEDDING MODEL
-# ============================================================
-
-@st.cache_resource
-def load_embedding_safely():
-
-    if load_embedding_model is None:
-
-        return None
-
-    try:
-
-        return load_embedding_model()
-
-    except Exception:
-
-        return None
-
-
-embedding_model = load_embedding_safely()
-
-
-# ============================================================
-# MITRE ATT&CK DATA
-# ============================================================
 
 @st.cache_data
-def load_mitre_data():
+def load_mitre():
 
-    if not os.path.exists(
-        MITRE_FILE
-    ):
+    file_path = find_mitre_file()
+
+    if file_path is None:
 
         return []
 
     try:
 
         with open(
-            MITRE_FILE,
+            file_path,
             "r",
             encoding="utf-8"
         ) as file:
 
-            data = json.load(
-                file
-            )
+            data = json.load(file)
 
-        if isinstance(
-            data,
-            dict
-        ):
+        objects = data.get(
+            "objects",
+            []
+        )
 
-            return data.get(
-                "objects",
+        techniques = []
+
+        for obj in objects:
+
+            if obj.get(
+                "type"
+            ) != "attack-pattern":
+
+                continue
+
+            if obj.get(
+                "revoked",
+                False
+            ):
+
+                continue
+
+            if obj.get(
+                "x_mitre_deprecated",
+                False
+            ):
+
+                continue
+
+            technique_id = ""
+
+            for reference in obj.get(
+                "external_references",
                 []
+            ):
+
+                if (
+                    reference.get(
+                        "source_name"
+                    )
+                    == "mitre-attack"
+                ):
+
+                    technique_id = (
+                        reference.get(
+                            "external_id",
+                            ""
+                        )
+                    )
+
+                    break
+
+            if not technique_id:
+
+                continue
+
+            if not technique_id.startswith(
+                "T"
+            ):
+
+                continue
+
+            phases = []
+
+            for phase in obj.get(
+                "kill_chain_phases",
+                []
+            ):
+
+                phases.append(
+                    phase.get(
+                        "phase_name",
+                        ""
+                    )
+                )
+
+            techniques.append(
+                {
+                    "id": technique_id,
+
+                    "name": obj.get(
+                        "name",
+                        ""
+                    ),
+
+                    "description": obj.get(
+                        "description",
+                        ""
+                    ),
+
+                    "platforms": obj.get(
+                        "x_mitre_platforms",
+                        []
+                    ),
+
+                    "phases": phases
+                }
             )
 
-        if isinstance(
-            data,
-            list
-        ):
-
-            return data
+        return techniques
 
     except Exception:
 
         return []
 
-    return []
 
-
-mitre_data = load_mitre_data()
-
-
-# ============================================================
-# LOCAL MITRE SEARCH
-# ============================================================
-
-def local_mitre_search(
-    query
-):
-
-    if not mitre_data:
-
-        return []
-
-    query = query.lower().strip()
-
-    results = []
-
-    for item in mitre_data:
-
-        if not isinstance(
-            item,
-            dict
-        ):
-
-            continue
-
-        name = str(
-            item.get(
-                "name",
-                ""
-            )
-        )
-
-        description = str(
-            item.get(
-                "description",
-                ""
-            )
-        )
-
-        technique_id = ""
-
-        references = item.get(
-            "external_references",
-            []
-        )
-
-        for reference in references:
-
-            if not isinstance(
-                reference,
-                dict
-            ):
-
-                continue
-
-            if reference.get(
-                "source_name"
-            ) == "mitre-attack":
-
-                technique_id = str(
-                    reference.get(
-                        "external_id",
-                        ""
-                    )
-                )
-
-                break
-
-        searchable_text = (
-            name
-            + " "
-            + description
-            + " "
-            + technique_id
-        ).lower()
-
-        if query in searchable_text:
-
-            results.append(
-                {
-                    "id": technique_id,
-                    "name": name,
-                    "description": description
-                }
-            )
-
-        if len(results) >= 10:
-
-            break
-
-    return results
+MITRE_TECHNIQUES = load_mitre()
 
 
 # ============================================================
 # MITRE SEARCH
 # ============================================================
 
-def search_mitre(
-    query
+def tokenize(text):
+
+    return set(
+        re.findall(
+            r"[a-zA-Z0-9_-]+",
+            str(text).lower()
+        )
+    )
+
+
+def similarity_score(
+    query,
+    document
 ):
 
-    if not query.strip():
+    query_tokens = tokenize(
+        query
+    )
+
+    document_tokens = tokenize(
+        document
+    )
+
+    if not query_tokens:
+        return 0
+
+    if not document_tokens:
+        return 0
+
+    common = query_tokens.intersection(
+        document_tokens
+    )
+
+    return (
+        len(common)
+        /
+        max(
+            1,
+            len(query_tokens)
+        )
+    )
+
+
+def search_mitre(
+    query,
+    top_k=3
+):
+
+    query = sanitize_text(
+        query
+    )
+
+    if not query:
 
         return []
 
-    # Try semantic search first
-    if (
-        search_mitre_engine is not None
-        and embedding_model is not None
-        and faiss_index is not None
-    ):
+    results = []
+
+    query_lower = query.lower()
+
+    for technique in MITRE_TECHNIQUES:
+
+        searchable_text = " ".join(
+            [
+                technique["id"],
+
+                technique["name"],
+
+                technique["description"],
+
+                " ".join(
+                    technique["phases"]
+                ),
+
+                " ".join(
+                    technique["platforms"]
+                )
+            ]
+        )
+
+        score = similarity_score(
+            query,
+            searchable_text
+        )
+
+        technique_id = (
+            technique["id"].lower()
+        )
+
+        technique_name = (
+            technique["name"].lower()
+        )
+
+        # Exact MITRE ID boost
+        if technique_id in query_lower:
+
+            score += 3.0
+
+        # Exact technique-name boost
+        if technique_name in query_lower:
+
+            score += 2.0
+
+        # Useful security keyword boosts
+        keywords = {
+            "powershell": [
+                "powershell",
+                "command",
+                "scripting"
+            ],
+
+            "credential": [
+                "credential",
+                "password",
+                "credential dumping"
+            ],
+
+            "scan": [
+                "scan",
+                "scanning",
+                "reconnaissance",
+                "port"
+            ],
+
+            "network": [
+                "network",
+                "connection",
+                "traffic"
+            ],
+
+            "execution": [
+                "execute",
+                "execution",
+                "command"
+            ]
+        }
+
+        for keyword, words in keywords.items():
+
+            if any(
+                word in query_lower
+                for word in words
+            ):
+
+                if keyword in searchable_text.lower():
+
+                    score += 0.5
+
+        results.append(
+            (
+                score,
+                technique
+            )
+        )
+
+    results.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    final_results = []
+
+    for score, technique in results:
+
+        if score <= 0:
+
+            continue
+
+        item = technique.copy()
+
+        item["similarity"] = round(
+            float(score),
+            4
+        )
+
+        final_results.append(
+            item
+        )
+
+        if len(
+            final_results
+        ) >= top_k:
+
+            break
+
+    return final_results
+
+
+# ============================================================
+# EXPLICIT TOP-3 RETRIEVAL
+# ============================================================
+
+def get_top3_mitre(
+    query
+):
+
+    """
+    Retrieve exactly the top three
+    relevant MITRE ATT&CK techniques.
+    """
+
+    results = search_mitre(
+        query,
+        top_k=3
+    )
+
+    return results[:3]
+
+
+# ============================================================
+# MITRE ID VERIFICATION
+# ============================================================
+
+def verify_mitre_ids(
+    ids
+):
+
+    valid_ids = {
+        technique["id"]
+        for technique in MITRE_TECHNIQUES
+    }
+
+    verified = []
+    fabricated = []
+
+    for technique_id in ids:
+
+        clean_id = str(
+            technique_id
+        ).strip().upper()
+
+        if clean_id in valid_ids:
+
+            verified.append(
+                clean_id
+            )
+
+        else:
+
+            fabricated.append(
+                clean_id
+            )
+
+    total = (
+        len(verified)
+        +
+        len(fabricated)
+    )
+
+    fabricated_rate = (
+
+        len(fabricated)
+        /
+        total
+
+        if total > 0
+
+        else 0
+    )
+
+    return {
+        "verified": verified,
+
+        "fabricated": fabricated,
+
+        "fabricated_rate":
+            fabricated_rate
+    }
+
+
+# ============================================================
+# SEMANTIC TELEMETRY DESCRIPTION
+# ============================================================
+
+def semantic_parse(
+    data
+):
+
+    descriptions = []
+
+    field_labels = {
+
+        "dur":
+            "connection duration",
+
+        "sbytes":
+            "source bytes",
+
+        "dbytes":
+            "destination bytes",
+
+        "spkts":
+            "source packets",
+
+        "dpkts":
+            "destination packets",
+
+        "sttl":
+            "source TTL",
+
+        "dttl":
+            "destination TTL",
+
+        "sload":
+            "source load",
+
+        "dload":
+            "destination load",
+
+        "tcprtt":
+            "TCP round-trip time",
+
+        "synack":
+            "SYN-ACK delay",
+
+        "ackdat":
+            "ACK delay",
+
+        "ct_state_ttl":
+            "state/TTL connection count",
+
+        "ct_flw_http_mthd":
+            "HTTP method count",
+
+        "is_ftp_login":
+            "FTP login indicator",
+
+        "ct_dst_src_ltm":
+            "destination-source relationship count"
+    }
+
+    for key, label in field_labels.items():
+
+        if key not in data:
+
+            continue
+
+        value = data[key]
 
         try:
 
-            results = search_mitre_engine(
-                query,
-                embedding_model,
-                faiss_index,
-                mitre_data
-            )
+            if pd.isna(value):
 
-            if results:
-
-                return results
+                continue
 
         except Exception:
 
             pass
 
-    # Fallback to direct JSON search
-    return local_mitre_search(
-        query
+        descriptions.append(
+            f"{label}: {value}"
+        )
+
+    if not descriptions:
+
+        return (
+            "No numerical network telemetry "
+            "was available for semantic parsing."
+        )
+
+    return " | ".join(
+        descriptions
     )
 
 
 # ============================================================
-# RISK SCORE
+# MODEL INPUT
 # ============================================================
 
-def calculate_risk(
-    alert,
-    mitre_results
+def prepare_model_input(
+    data
 ):
 
-    text = alert.lower()
+    if not feature_columns:
 
-    risk = 15
+        raise ValueError(
+            "Feature columns are unavailable."
+        )
 
-    keywords = [
-
-        "powershell",
-        "cmd.exe",
-        "phishing",
-        "credential",
-        "brute force",
-        "failed login",
-        "malware",
-        "ransomware",
-        "exfiltration",
-        "privilege escalation",
-        "successful login",
-        "remote access",
-        "rdp",
-        "ssh",
-        "suspicious",
-        "attack"
-    ]
-
-    for keyword in keywords:
-
-        if keyword in text:
-
-            risk += 5
-
-    if mitre_results:
-
-        risk += 10
-
-    return min(
-        risk,
-        95
+    input_df = pd.DataFrame(
+        [data]
     )
 
-
-# ============================================================
-# SEVERITY
-# ============================================================
-
-def get_severity(
-    risk
-):
-
-    if risk >= 75:
-
-        return "CRITICAL"
-
-    if risk >= 50:
-
-        return "HIGH"
-
-    if risk >= 25:
-
-        return "MEDIUM"
-
-    return "LOW"
-
-
-# ============================================================
-# ATTACK DESCRIPTION
-# ============================================================
-
-def get_description(
-    alert
-):
-
-    text = alert.lower()
-
-    if (
-        "powershell" in text
-        or "cmd.exe" in text
-        or "command execution" in text
-    ):
-
-        return (
-            "Possible command execution activity was detected. "
-            "Review command-line arguments, parent processes, "
-            "user accounts and endpoint telemetry."
-        )
-
-    if (
-        "phishing" in text
-        or "malicious email" in text
-    ):
-
-        return (
-            "Possible phishing activity was detected. "
-            "Review sender information, URLs, attachments "
-            "and affected recipients."
-        )
-
-    if (
-        "brute force" in text
-        or "failed login" in text
-        or "password guessing" in text
-    ):
-
-        return (
-            "Repeated authentication attempts may indicate "
-            "brute-force activity. Review authentication logs "
-            "and successful login events."
-        )
-
-    if (
-        "credential" in text
-        or "password" in text
-    ):
-
-        return (
-            "Possible credential-related activity was detected. "
-            "Review authentication events, account activity "
-            "and unusual access."
-        )
-
-    if (
-        "malware" in text
-        or "ransomware" in text
-        or "trojan" in text
-    ):
-
-        return (
-            "Potential malicious software activity was detected. "
-            "Investigate affected endpoints, processes, files "
-            "and network connections."
-        )
-
-    if (
-        "exfiltration" in text
-        or "data theft" in text
-    ):
-
-        return (
-            "Possible unauthorized data transfer was detected. "
-            "Review the source, destination, volume and timing."
-        )
-
-    if (
-        "rdp" in text
-        or "remote desktop" in text
-        or "ssh" in text
-    ):
-
-        return (
-            "Unexpected remote access activity was detected. "
-            "Validate the source IP, account and authorization."
-        )
-
-    return (
-        "Potentially suspicious activity was detected. "
-        "Correlate this alert with endpoint, authentication "
-        "and network telemetry."
+    output = pd.DataFrame(
+        0.0,
+        index=[0],
+        columns=feature_columns
     )
 
+    categorical_map = {
+
+        "tcp": 1,
+        "udp": 2,
+        "icmp": 3,
+        "http": 4,
+        "https": 5,
+        "ftp": 6,
+        "ssh": 7,
+        "dns": 8
+    }
+
+    for column in feature_columns:
+
+        if column not in input_df.columns:
+
+            continue
+
+        value = input_df.iloc[
+            0
+        ][column]
+
+        try:
+
+            if pd.isna(value):
+
+                continue
+
+        except Exception:
+
+            pass
+
+        try:
+
+            output.loc[
+                0,
+                column
+            ] = float(value)
+
+        except Exception:
+
+            output.loc[
+                0,
+                column
+            ] = categorical_map.get(
+                str(value).lower(),
+                0
+            )
+
+    return output
+
 
 # ============================================================
-# RECOMMENDED ACTIONS
+# NETWORK PREDICTION
 # ============================================================
 
-def get_actions(
-    alert
+def predict_network(
+    data
 ):
 
-    text = alert.lower()
+    if classifier is None:
 
-    actions = [
+        return {
 
-        "Review related security logs.",
+            "prediction":
+                "Unavailable",
 
-        "Identify affected hosts and users.",
+            "probability":
+                0.0,
 
-        "Correlate endpoint and network telemetry.",
+            "severity":
+                "Unknown",
 
-        "Check whether the activity is expected."
-    ]
+            "risk_score":
+                0,
 
-    if (
-        "powershell" in text
-        or "command" in text
-    ):
+            "error":
+                model_error
+        }
 
-        actions.append(
-            "Review command lines and parent-child processes."
+    try:
+
+        X = prepare_model_input(
+            data
         )
 
-    if (
-        "phishing" in text
-        or "email" in text
-    ):
+        prediction = classifier.predict(
+            X
+        )[0]
 
-        actions.append(
-            "Inspect URLs, attachments and affected recipients."
-        )
+        probability = 0.0
 
-    if (
-        "login" in text
-        or "credential" in text
-    ):
+        if hasattr(
+            classifier,
+            "predict_proba"
+        ):
 
-        actions.append(
-            "Validate authentication and account activity."
-        )
+            probabilities = (
+                classifier.predict_proba(
+                    X
+                )[0]
+            )
 
-    return actions
-
-
-# ============================================================
-# REPORT GENERATOR
-# ============================================================
-
-def create_report(
-    result
-):
-
-    lines = [
-
-        "TRIAGEMIND AI SECURITY REPORT",
-
-        "=" * 45,
-
-        "",
-
-        "Incident ID: "
-        + result["incident_id"],
-
-        "Time: "
-        + result["time"],
-
-        "Risk Score: "
-        + str(result["risk"])
-        + "/100",
-
-        "Severity: "
-        + result["severity"],
-
-        "",
-
-        "SECURITY ALERT",
-
-        "-" * 25,
-
-        result["alert"],
-
-        "",
-
-        "ATTACK DESCRIPTION",
-
-        "-" * 25,
-
-        result["description"],
-
-        "",
-
-        "MITRE ATT&CK",
-
-        "-" * 25
-    ]
-
-    if result["mitre"]:
-
-        for item in result["mitre"]:
-
-            lines.append(
-                str(
-                    item.get(
-                        "id",
-                        ""
-                    )
-                )
-                + " - "
-                + str(
-                    item.get(
-                        "name",
-                        ""
-                    )
+            classes = list(
+                getattr(
+                    classifier,
+                    "classes_",
+                    []
                 )
             )
 
-    else:
+            attack_indexes = []
 
-        lines.append(
-            "No automatic MITRE match found."
+            for index, cls in enumerate(
+                classes
+            ):
+
+                label = str(
+                    cls
+                ).lower()
+
+                if (
+                    label in [
+                        "1",
+                        "attack",
+                        "anomaly",
+                        "malicious",
+                        "true"
+                    ]
+                    or
+                    "attack" in label
+                    or
+                    "malicious" in label
+                    or
+                    "anomaly" in label
+                ):
+
+                    attack_indexes.append(
+                        index
+                    )
+
+            if attack_indexes:
+
+                probability = max(
+                    probabilities[index]
+                    for index
+                    in attack_indexes
+                )
+
+            elif len(
+                probabilities
+            ) > 1:
+
+                probability = max(
+                    probabilities
+                )
+
+            else:
+
+                probability = float(
+                    probabilities[0]
+                )
+
+        else:
+
+            label = str(
+                prediction
+            ).lower()
+
+            if label in [
+                "0",
+                "normal",
+                "benign"
+            ]:
+
+                probability = 0.0
+
+            else:
+
+                probability = 1.0
+
+        if probability >= 0.90:
+
+            severity = "Critical"
+
+        elif probability >= 0.70:
+
+            severity = "High"
+
+        elif probability >= 0.45:
+
+            severity = "Medium"
+
+        else:
+
+            severity = "Low"
+
+        risk_score = int(
+            min(
+                100,
+                probability * 100
+            )
         )
 
-    lines.extend(
-        [
-            "",
-            "RECOMMENDED ACTIONS",
-            "-" * 25
-        ]
+        return {
+
+            "prediction":
+                str(prediction),
+
+            "probability":
+                float(probability),
+
+            "severity":
+                severity,
+
+            "risk_score":
+                risk_score,
+
+            "error":
+                None
+        }
+
+    except Exception as error:
+
+        return {
+
+            "prediction":
+                "Prediction error",
+
+            "probability":
+                0.0,
+
+            "severity":
+                "Unknown",
+
+            "risk_score":
+                0,
+
+            "error":
+                str(error)
+        }
+
+
+# ============================================================
+# RECOMMENDATIONS
+# ============================================================
+
+def generate_recommendations(
+    result,
+    mitre_results
+):
+
+    recommendations = []
+
+    severity = result.get(
+        "severity"
     )
 
-    for action in result["actions"]:
+    if severity in [
+        "Critical",
+        "High"
+    ]:
+
+        recommendations.extend(
+            [
+                "Review the affected host immediately.",
+
+                "Check source and destination communication logs.",
+
+                "Review authentication and process activity.",
+
+                "Correlate this alert with related security events."
+            ]
+        )
+
+    elif severity == "Medium":
+
+        recommendations.extend(
+            [
+                "Review surrounding network activity.",
+
+                "Validate whether the traffic is expected.",
+
+                "Correlate the event with other alerts."
+            ]
+        )
+
+    else:
+
+        recommendations.extend(
+            [
+                "Continue monitoring the activity.",
+
+                "Compare the event against the normal baseline."
+            ]
+        )
+
+    if mitre_results:
+
+        recommendations.append(
+            "Validate the retrieved MITRE ATT&CK "
+            "techniques against the original telemetry."
+        )
+
+    return recommendations
+
+
+# ============================================================
+# REPORT
+# ============================================================
+
+def build_report(
+    result,
+    telemetry,
+    mitre_results,
+    verification,
+    recommendations,
+    analyst,
+    notes
+):
+
+    lines = []
+
+    lines.append(
+        "=" * 70
+    )
+
+    lines.append(
+        "TRIAGEMIND AI - SECURITY TRIAGE REPORT"
+    )
+
+    lines.append(
+        "=" * 70
+    )
+
+    lines.append("")
+
+    lines.append(
+        "Generated: "
+        +
+        datetime.now().isoformat(
+            timespec="seconds"
+        )
+    )
+
+    lines.append(
+        "Analyst: "
+        +
+        (
+            analyst
+            if analyst
+            else "Not specified"
+        )
+    )
+
+    lines.append("")
+
+    lines.append(
+        "MODEL ASSESSMENT"
+    )
+
+    lines.append(
+        "-" * 40
+    )
+
+    lines.append(
+        "Prediction: "
+        +
+        str(
+            result.get(
+                "prediction"
+            )
+        )
+    )
+
+    lines.append(
+        "Probability: "
+        +
+        f"{result.get('probability', 0) * 100:.2f}%"
+    )
+
+    lines.append(
+        "Severity: "
+        +
+        str(
+            result.get(
+                "severity"
+            )
+        )
+    )
+
+    lines.append(
+        "Risk Score: "
+        +
+        str(
+            result.get(
+                "risk_score"
+            )
+        )
+        +
+        "/100"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "SEMANTIC TELEMETRY"
+    )
+
+    lines.append(
+        "-" * 40
+    )
+
+    lines.append(
+        telemetry
+    )
+
+    lines.append("")
+
+    lines.append(
+        "TOP 3 MITRE ATT&CK TECHNIQUES"
+    )
+
+    lines.append(
+        "-" * 40
+    )
+
+    for rank, item in enumerate(
+        mitre_results[:3],
+        start=1
+    ):
 
         lines.append(
-            "- " + action
+            f"Rank #{rank}: "
+            f"{item['id']} - "
+            f"{item['name']}"
         )
+
+        lines.append(
+            f"Similarity: "
+            f"{item.get('similarity', 0)}"
+        )
+
+        lines.append(
+            "Description: "
+            +
+            sanitize_text(
+                item.get(
+                    "description",
+                    ""
+                )
+            )[:1000]
+        )
+
+        lines.append("")
+
+    lines.append(
+        "MITRE CITATION VERIFICATION"
+    )
+
+    lines.append(
+        "-" * 40
+    )
+
+    lines.append(
+        "Verified IDs: "
+        +
+        (
+            ", ".join(
+                verification[
+                    "verified"
+                ]
+            )
+            or "None"
+        )
+    )
+
+    lines.append(
+        "Invalid/Fabricated IDs: "
+        +
+        (
+            ", ".join(
+                verification[
+                    "fabricated"
+                ]
+            )
+            or "None"
+        )
+    )
+
+    lines.append(
+        "Fabricated-ID Rate: "
+        +
+        f"{verification['fabricated_rate'] * 100:.2f}%"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "RECOMMENDED ACTIONS"
+    )
+
+    lines.append(
+        "-" * 40
+    )
+
+    for index, action in enumerate(
+        recommendations,
+        start=1
+    ):
+
+        lines.append(
+            f"{index}. {action}"
+        )
+
+    lines.append("")
+
+    lines.append(
+        "ANALYST NOTES"
+    )
+
+    lines.append(
+        "-" * 40
+    )
+
+    lines.append(
+        notes
+        if notes
+        else
+        "No analyst notes."
+    )
+
+    lines.append("")
 
     return "\n".join(
         lines
@@ -791,11 +1470,19 @@ def create_report(
 st.markdown(
     """
     <div class="hero">
-        <h1>🛡️ TriageMind AI</h1>
-        <p>Intelligent Cybersecurity Alert Triage Platform</p>
-        <p>
-        Machine Learning • Network Detection • MITRE ATT&CK • SOC Investigation
-        </p>
+
+    <h1>🛡️ TriageMind AI</h1>
+
+    <h3>
+    Intelligent Cybersecurity Alert Triage Platform
+    </h3>
+
+    <p>
+    Machine-learning network detection combined with
+    MITRE ATT&CK Top-3 technique retrieval,
+    semantic telemetry analysis and SOC investigation.
+    </p>
+
     </div>
     """,
     unsafe_allow_html=True
@@ -808,190 +1495,168 @@ st.markdown(
 
 with st.sidebar:
 
-    st.title(
-        "🛡️ TriageMind"
-    )
-
-    st.caption(
-        "SOC Analyst Workspace"
-    )
-
-    st.divider()
-
-    st.subheader(
+    st.header(
         "System Status"
     )
 
     if classifier is not None:
 
         st.success(
-            "ML Model Ready"
+            "ML classifier loaded"
         )
 
     else:
 
         st.error(
-            "ML Model Unavailable"
+            "ML classifier unavailable"
         )
 
-    if feature_columns:
+    if MITRE_TECHNIQUES:
 
         st.success(
-            str(
-                len(feature_columns)
-            )
-            + " Model Features"
+            f"MITRE database loaded: "
+            f"{len(MITRE_TECHNIQUES)} techniques"
         )
 
     else:
 
-        st.warning(
-            "Feature columns unavailable"
+        st.error(
+            "MITRE database unavailable"
         )
 
-    if mitre_data:
+    analyst_name = st.text_input(
+        "Analyst Name",
+        "Security Analyst"
+    )
 
-        st.success(
-            str(
-                len(mitre_data)
-            )
-            + " MITRE Objects"
-        )
+    st.divider()
 
-    else:
+    st.caption(
+        "TriageMind AI"
+    )
 
-        st.warning(
-            "MITRE data unavailable"
-        )
-
-    if faiss_index is not None:
-
-        st.success(
-            "FAISS Ready"
-        )
-
-    else:
-
-        st.info(
-            "FAISS unavailable"
-        )
+    st.caption(
+        "ML Detection + MITRE ATT&CK"
+    )
 
 
 # ============================================================
-# FIVE TABS
+# TABS
 # ============================================================
 
-dashboard_tab, triage_tab, network_tab, mitre_tab, investigation_tab = st.tabs(
+dashboard_tab, triage_tab, network_tab, mitre_tab, soc_tab, diagnostics_tab = st.tabs(
     [
-        "🏠 Overview",
+        "🏠 Dashboard",
         "🚨 Alert Triage",
-        "📊 Network Detection",
+        "🌐 Network Detection",
         "🎯 MITRE ATT&CK",
-        "🛡️ Investigation"
+        "🛡️ SOC Investigation",
+        "⚙️ Diagnostics"
     ]
 )
 
 
 # ============================================================
-# TAB 1 - OVERVIEW
+# DASHBOARD
 # ============================================================
 
 with dashboard_tab:
 
-    st.header(
-        "Security Operations Overview"
+    history = load_history()
+
+    total = len(
+        history
     )
 
-    col1, col2, col3, col4 = st.columns(4)
+    high_count = 0
 
-    col1.metric(
+    average_risk = 0
+
+    if not history.empty:
+
+        high_count = len(
+            history[
+                history[
+                    "severity"
+                ].isin(
+                    [
+                        "High",
+                        "Critical"
+                    ]
+                )
+            ]
+        )
+
+        average_risk = (
+            history[
+                "risk_score"
+            ].mean()
+        )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
         "Investigations",
-        len(
-            st.session_state.history
-        )
+        total
     )
 
-    col2.metric(
-        "MITRE Objects",
-        len(
-            mitre_data
-        )
+    c2.metric(
+        "High/Critical",
+        high_count
     )
 
-    col3.metric(
-        "Model Features",
-        len(
-            feature_columns
-        )
-        if feature_columns
-        else 0
+    c3.metric(
+        "Average Risk",
+        f"{average_risk:.1f}"
     )
 
-    col4.metric(
-        "ML Status",
-        "READY"
-        if classifier is not None
-        else "OFFLINE"
+    c4.metric(
+        "MITRE Techniques",
+        len(
+            MITRE_TECHNIQUES
+        )
     )
 
     st.divider()
 
     st.subheader(
-        "Detection Pipeline"
+        "TriageMind Workflow"
     )
 
-    pipeline = pd.DataFrame(
-        {
-            "Stage": [
+    a, b, c, d = st.columns(4)
 
-                "Network Data",
-
-                "ML Detection",
-
-                "MITRE Enrichment",
-
-                "Risk Assessment",
-
-                "SOC Investigation"
-            ],
-
-            "Status": [
-
-                "Ready"
-                if classifier
-                else "Unavailable",
-
-                "Ready"
-                if classifier
-                else "Unavailable",
-
-                "Ready"
-                if mitre_data
-                else "Unavailable",
-
-                "Ready",
-
-                "Ready"
-            ]
-        }
+    a.info(
+        "1️⃣\n\n"
+        "**Telemetry**\n\n"
+        "Network/security input"
     )
 
-    st.dataframe(
-        pipeline,
-        use_container_width=True,
-        hide_index=True
+    b.info(
+        "2️⃣\n\n"
+        "**ML Detection**\n\n"
+        "Detect suspicious activity"
     )
 
-    st.subheader(
-        "Recent Investigations"
+    c.info(
+        "3️⃣\n\n"
+        "**MITRE Top-3**\n\n"
+        "Retrieve ATT&CK techniques"
     )
 
-    if st.session_state.history:
+    d.info(
+        "4️⃣\n\n"
+        "**SOC Investigation**\n\n"
+        "Risk and response"
+    )
+
+    if not history.empty:
+
+        st.subheader(
+            "Recent Investigations"
+        )
 
         st.dataframe(
-            pd.DataFrame(
-                st.session_state.history
-            ),
+            history,
             use_container_width=True,
             hide_index=True
         )
@@ -1004,7 +1669,7 @@ with dashboard_tab:
 
 
 # ============================================================
-# TAB 2 - ALERT TRIAGE
+# ALERT TRIAGE
 # ============================================================
 
 with triage_tab:
@@ -1013,209 +1678,318 @@ with triage_tab:
         "🚨 Alert Triage"
     )
 
-    st.caption(
-        "Analyze a security alert and enrich it with MITRE ATT&CK."
+    st.write(
+        "Enter a security alert and TriageMind "
+        "will perform network assessment and "
+        "retrieve the Top-3 MITRE ATT&CK techniques."
     )
 
-    alert = st.text_area(
+    alert_text = st.text_area(
         "Security Alert",
         height=160,
         placeholder=(
-            "Example: Multiple failed login attempts "
-            "from an external IP followed by a successful login."
+            "Example: "
+            "Multiple failed login attempts followed "
+            "by suspicious PowerShell activity."
         )
     )
 
-    col1, col2 = st.columns(2)
+    c1, c2 = st.columns(2)
 
-    with col1:
+    with c1:
 
         source_ip = st.text_input(
-            "Source IP"
+            "Source IP",
+            "192.168.1.50"
         )
-
-    with col2:
 
         destination_ip = st.text_input(
-            "Destination IP"
+            "Destination IP",
+            "10.0.0.20"
         )
 
-    analyst_notes = st.text_area(
-        "Analyst Notes"
+        protocol = st.selectbox(
+            "Protocol",
+            [
+                "TCP",
+                "UDP",
+                "ICMP",
+                "HTTP",
+                "HTTPS",
+                "DNS",
+                "SSH",
+                "FTP"
+            ]
+        )
+
+    with c2:
+
+        source_port = st.number_input(
+            "Source Port",
+            0,
+            65535,
+            49152
+        )
+
+        destination_port = st.number_input(
+            "Destination Port",
+            0,
+            65535,
+            443
+        )
+
+        packets = st.number_input(
+            "Packet Count",
+            0,
+            1000000,
+            100
+        )
+
+    notes = st.text_area(
+        "Analyst Notes",
+        height=100
     )
 
-    analyze_button = st.button(
+    if st.button(
         "🔍 Analyze Alert",
         type="primary",
         use_container_width=True
-    )
+    ):
 
-    if analyze_button:
+        clean_alert = sanitize_text(
+            alert_text
+        )
 
-        if not alert.strip():
+        if not clean_alert:
 
             st.warning(
-                "Please enter a security alert."
+                "Enter a security alert first."
             )
 
         else:
 
-            with st.spinner(
-                "Analyzing alert..."
-            ):
+            network_data = {
 
-                mitre_matches = search_mitre(
-                    alert
-                )
+                "dur":
+                    10,
 
-            risk = calculate_risk(
-                alert,
-                mitre_matches
-            )
+                "sbytes":
+                    5000,
 
-            severity = get_severity(
-                risk
-            )
+                "dbytes":
+                    3000,
 
-            incident_id = (
-                "TM-"
-                + datetime.now().strftime(
-                    "%Y%m%d%H%M%S"
-                )
-            )
+                "spkts":
+                    packets,
 
-            result = {
+                "dpkts":
+                    packets,
 
-                "incident_id":
-                    incident_id,
+                "sttl":
+                    64,
 
-                "time":
-                    datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
+                "dttl":
+                    64,
 
-                "alert":
-                    alert,
+                "sport":
+                    source_port,
 
-                "source_ip":
-                    source_ip,
+                "dsport":
+                    destination_port,
 
-                "destination_ip":
-                    destination_ip,
-
-                "notes":
-                    analyst_notes,
-
-                "risk":
-                    risk,
-
-                "severity":
-                    severity,
-
-                "description":
-                    get_description(
-                        alert
-                    ),
-
-                "mitre":
-                    mitre_matches,
-
-                "actions":
-                    get_actions(
-                        alert
-                    )
+                "proto":
+                    protocol.lower()
             }
 
-            st.session_state.last_alert = result
-
-            st.session_state.history.append(
-                {
-                    "Incident ID":
-                        incident_id,
-
-                    "Time":
-                        result["time"],
-
-                    "Risk":
-                        str(risk)
-                        + "/100",
-
-                    "Severity":
-                        severity,
-
-                    "MITRE Matches":
-                        len(
-                            mitre_matches
-                        )
-                }
+            result = predict_network(
+                network_data
             )
 
-    result = st.session_state.last_alert
+            # ==================================================
+            # TOP 3 MITRE RETRIEVAL
+            # ==================================================
 
-    if result:
+            mitre_results = get_top3_mitre(
+                clean_alert
+            )
+
+            mitre_ids = [
+                item["id"]
+                for item
+                in mitre_results[:3]
+            ]
+
+            verification = verify_mitre_ids(
+                mitre_ids
+            )
+
+            telemetry = semantic_parse(
+                network_data
+            )
+
+            recommendations = (
+                generate_recommendations(
+                    result,
+                    mitre_results
+                )
+            )
+
+            result[
+                "mitre_ids"
+            ] = verification[
+                "verified"
+            ]
+
+            result[
+                "alert"
+            ] = clean_alert
+
+            st.session_state[
+                "latest_result"
+            ] = result
+
+            st.session_state[
+                "latest_mitre"
+            ] = mitre_results
+
+            st.session_state[
+                "latest_verification"
+            ] = verification
+
+            st.session_state[
+                "latest_telemetry"
+            ] = telemetry
+
+            st.session_state[
+                "latest_recommendations"
+            ] = recommendations
+
+            st.session_state[
+                "latest_notes"
+            ] = notes
+
+            save_investigation(
+                result,
+                analyst_name,
+                notes,
+                "Manual Alert"
+            )
+
+            st.success(
+                "Analysis completed and saved."
+            )
+
+
+# ============================================================
+# LATEST TRIAGE RESULT
+# ============================================================
+
+if (
+    "latest_result"
+    in st.session_state
+):
+
+    with triage_tab:
+
+        result = st.session_state[
+            "latest_result"
+        ]
 
         st.divider()
 
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Risk Score",
-            str(
-                result["risk"]
-            )
-            + "/100"
+        st.subheader(
+            "Security Assessment"
         )
 
-        col2.metric(
+        a, b, c, d = st.columns(4)
+
+        a.metric(
+            "Prediction",
+            result[
+                "prediction"
+            ]
+        )
+
+        b.metric(
+            "Probability",
+            f"{result['probability'] * 100:.2f}%"
+        )
+
+        c.metric(
             "Severity",
-            result["severity"]
+            result[
+                "severity"
+            ]
         )
 
-        col3.metric(
-            "MITRE Matches",
-            len(
-                result["mitre"]
+        d.metric(
+            "Risk Score",
+            f"{result['risk_score']}/100"
+        )
+
+        if result.get(
+            "error"
+        ):
+
+            st.warning(
+                result[
+                    "error"
+                ]
             )
-        )
-
-        st.progress(
-            result["risk"] / 100
-        )
 
         st.subheader(
-            "📖 Attack Description"
+            "Semantic Telemetry"
         )
 
-        st.info(
-            result["description"]
+        st.code(
+            st.session_state[
+                "latest_telemetry"
+            ]
         )
+
+        # ======================================================
+        # TOP 3 MITRE
+        # ======================================================
 
         st.subheader(
-            "🎯 MITRE ATT&CK"
+            "🎯 Top 3 MITRE ATT&CK Techniques"
         )
 
-        if result["mitre"]:
+        latest_mitre = (
+            st.session_state[
+                "latest_mitre"
+            ]
+        )
 
-            for item in result["mitre"]:
+        if latest_mitre:
 
-                technique_id = str(
-                    item.get(
-                        "id",
-                        ""
-                    )
-                )
+            for rank, item in enumerate(
+                latest_mitre[:3],
+                start=1
+            ):
 
-                technique_name = str(
-                    item.get(
-                        "name",
-                        "Unknown"
-                    )
+                st.markdown(
+                    f"""
+                    <div class="attack-card">
+
+                    <h3>
+                    #{rank} —
+                    {item['id']} —
+                    {item['name']}
+                    </h3>
+
+                    <p>
+                    <b>Retrieval Score:</b>
+                    {item.get('similarity', 0):.4f}
+                    </p>
+
+                    </div>
+                    """,
+                    unsafe_allow_html=True
                 )
 
                 with st.expander(
-                    technique_id
-                    + " — "
-                    + technique_name
+                    f"View {item['id']} details"
                 ):
 
                     st.write(
@@ -1225,63 +1999,114 @@ with triage_tab:
                         )
                     )
 
+                    if item.get(
+                        "phases"
+                    ):
+
+                        st.write(
+                            "**Tactics:** "
+                            +
+                            ", ".join(
+                                item[
+                                    "phases"
+                                ]
+                            )
+                        )
+
+                    if item.get(
+                        "platforms"
+                    ):
+
+                        st.write(
+                            "**Platforms:** "
+                            +
+                            ", ".join(
+                                item[
+                                    "platforms"
+                                ]
+                            )
+                        )
+
         else:
 
             st.info(
-                "No automatic MITRE match found."
+                "No MITRE ATT&CK techniques found."
             )
+
+        # ======================================================
+        # VERIFICATION
+        # ======================================================
+
+        verification = (
+            st.session_state[
+                "latest_verification"
+            ]
+        )
 
         st.subheader(
-            "🛠️ Recommended Investigation"
+            "MITRE Citation Verification"
         )
 
-        for action in result["actions"]:
+        v1, v2, v3 = st.columns(3)
+
+        v1.metric(
+            "Verified IDs",
+            len(
+                verification[
+                    "verified"
+                ]
+            )
+        )
+
+        v2.metric(
+            "Invalid IDs",
+            len(
+                verification[
+                    "fabricated"
+                ]
+            )
+        )
+
+        v3.metric(
+            "Fabricated-ID Rate",
+            f"{verification['fabricated_rate'] * 100:.2f}%"
+        )
+
+        st.subheader(
+            "Recommended Actions"
+        )
+
+        for action in (
+            st.session_state[
+                "latest_recommendations"
+            ]
+        ):
 
             st.write(
-                "• "
-                + action
+                "• " + action
             )
-
-        report = create_report(
-            result
-        )
-
-        st.download_button(
-            "⬇️ Download Security Report",
-            report,
-            result["incident_id"]
-            + ".txt",
-            "text/plain",
-            use_container_width=True
-        )
 
 
 # ============================================================
-# TAB 3 - NETWORK DETECTION
+# NETWORK DETECTION
 # ============================================================
 
 with network_tab:
 
     st.header(
-        "📊 Network Detection"
+        "🌐 Network Detection"
     )
 
-    st.caption(
-        "Upload network traffic data and run the trained classifier."
+    st.write(
+        "Upload a CSV containing network telemetry."
     )
 
     uploaded_file = st.file_uploader(
-        "Upload CSV Dataset",
+        "Upload network CSV",
         type=["csv"]
     )
 
-    if uploaded_file is None:
-
-        st.info(
-            "Upload a CSV file to begin."
-        )
-
-    else:
+    if uploaded_file:
 
         try:
 
@@ -1289,16 +2114,8 @@ with network_tab:
                 uploaded_file
             )
 
-            col1, col2 = st.columns(2)
-
-            col1.metric(
-                "Records",
-                len(df)
-            )
-
-            col2.metric(
-                "Columns",
-                len(df.columns)
+            st.success(
+                f"{len(df)} rows loaded."
             )
 
             st.dataframe(
@@ -1306,210 +2123,131 @@ with network_tab:
                 use_container_width=True
             )
 
-            if classifier is None:
+            if st.button(
+                "🚀 Run Network Detection",
+                type="primary"
+            ):
 
-                st.error(
-                    "ML classifier is unavailable."
+                predictions = []
+                probabilities = []
+                severities = []
+                risks = []
+
+                progress = st.progress(
+                    0
                 )
 
-            elif classify_csv is None:
+                for index in range(
+                    len(df)
+                ):
 
-                st.error(
-                    "classify_csv() was not found in triagemind_engine.py."
-                )
+                    row = df.iloc[
+                        index
+                    ].to_dict()
 
-            else:
+                    result = predict_network(
+                        row
+                    )
 
-                detection_button = st.button(
-                    "🤖 Run ML Detection",
-                    type="primary",
-                    use_container_width=True
-                )
+                    predictions.append(
+                        result[
+                            "prediction"
+                        ]
+                    )
 
-                if detection_button:
+                    probabilities.append(
+                        result[
+                            "probability"
+                        ]
+                    )
 
-                    temp_path = None
+                    severities.append(
+                        result[
+                            "severity"
+                        ]
+                    )
 
-                    try:
+                    risks.append(
+                        result[
+                            "risk_score"
+                        ]
+                    )
 
-                        with tempfile.NamedTemporaryFile(
-                            delete=False,
-                            suffix=".csv"
-                        ) as temp_file:
-
-                            uploaded_file.seek(
-                                0
+                    progress.progress(
+                        int(
+                            (
+                                (
+                                    index + 1
+                                )
+                                /
+                                len(df)
                             )
-
-                            temp_file.write(
-                                uploaded_file.getbuffer()
-                            )
-
-                            temp_path = (
-                                temp_file.name
-                            )
-
-                        with st.spinner(
-                            "Running ML detection..."
-                        ):
-
-                            predictions = classify_csv(
-                                temp_path,
-                                classifier,
-                                feature_columns
-                            )
-
-                        predictions = list(
-                            predictions
+                            * 100
                         )
+                    )
 
-                        if len(
-                            predictions
-                        ) != len(df):
+                output = df.copy()
 
-                            st.error(
-                                "The number of predictions does not match the number of rows."
-                            )
+                output[
+                    "prediction"
+                ] = predictions
 
-                        else:
+                output[
+                    "attack_probability"
+                ] = probabilities
 
-                            result_df = df.copy()
+                output[
+                    "severity"
+                ] = severities
 
-                            result_df[
-                                "TriageMind Prediction"
-                            ] = [
+                output[
+                    "risk_score"
+                ] = risks
 
-                                "Attack"
-                                if int(value) == 1
-                                else "Normal"
-
-                                for value
-                                in predictions
-                            ]
-
-                            attack_count = sum(
-                                int(value) == 1
-                                for value
-                                in predictions
-                            )
-
-                            normal_count = (
-                                len(
-                                    predictions
-                                )
-                                - attack_count
-                            )
-
-                            if len(
-                                predictions
-                            ) > 0:
-
-                                attack_rate = (
-                                    attack_count
-                                    /
-                                    len(
-                                        predictions
-                                    )
-                                    * 100
-                                )
-
-                            else:
-
-                                attack_rate = 0
-
-                            col1, col2, col3 = st.columns(3)
-
-                            col1.metric(
-                                "Attack",
-                                attack_count
-                            )
-
-                            col2.metric(
-                                "Normal",
-                                normal_count
-                            )
-
-                            col3.metric(
-                                "Attack Rate",
-                                f"{attack_rate:.2f}%"
-                            )
-
-                            st.subheader(
-                                "Detection Results"
-                            )
-
-                            st.dataframe(
-                                result_df.head(
-                                    100
-                                ),
-                                use_container_width=True
-                            )
-
-                            csv_data = (
-                                result_df
-                                .to_csv(
-                                    index=False
-                                )
-                                .encode(
-                                    "utf-8"
-                                )
-                            )
-
-                            st.download_button(
-                                "⬇️ Download Predictions",
-                                csv_data,
-                                "triagemind_predictions.csv",
-                                "text/csv",
-                                use_container_width=True
-                            )
-
-                            st.session_state.last_network = (
-                                result_df
-                            )
-
-                    except Exception as error:
-
-                        st.error(
-                            "Network detection failed."
-                        )
-
-                        st.code(
-                            str(error)
-                        )
-
-                    finally:
-
-                        if (
-                            temp_path
-                            and
-                            os.path.exists(
-                                temp_path
-                            )
-                        ):
-
-                            try:
-
-                                os.remove(
-                                    temp_path
-                                )
-
-                            except Exception:
-
-                                pass
+                st.session_state[
+                    "network_results"
+                ] = output
 
         except Exception as error:
 
             st.error(
-                "Could not read the CSV file."
+                f"CSV processing error: {error}"
             )
 
-            st.code(
-                str(error)
-            )
+    if (
+        "network_results"
+        in st.session_state
+    ):
+
+        output = st.session_state[
+            "network_results"
+        ]
+
+        st.subheader(
+            "Detection Results"
+        )
+
+        st.dataframe(
+            output,
+            use_container_width=True
+        )
+
+        csv_data = output.to_csv(
+            index=False
+        ).encode(
+            "utf-8"
+        )
+
+        st.download_button(
+            "⬇️ Download Results",
+            csv_data,
+            "triagemind_network_results.csv",
+            "text/csv"
+        )
 
 
 # ============================================================
-# TAB 4 - MITRE ATT&CK
+# MITRE EXPLORER
 # ============================================================
 
 with mitre_tab:
@@ -1518,186 +2256,402 @@ with mitre_tab:
         "🎯 MITRE ATT&CK Explorer"
     )
 
-    st.caption(
-        "Search the local MITRE ATT&CK knowledge base."
+    st.write(
+        "Search the local MITRE ATT&CK Enterprise knowledge base."
     )
 
-    mitre_query = st.text_input(
-        "Search Technique",
-        placeholder=(
-            "PowerShell, phishing, credential, brute force..."
-        )
-    )
+    if not MITRE_TECHNIQUES:
 
-    mitre_button = st.button(
-        "🔎 Search ATT&CK",
-        type="primary"
-    )
-
-    if mitre_button:
-
-        if not mitre_query.strip():
-
-            st.warning(
-                "Enter a search term."
-            )
-
-        else:
-
-            results = search_mitre(
-                mitre_query
-            )
-
-            if not results:
-
-                st.warning(
-                    "No matching technique found."
-                )
-
-            else:
-
-                for item in results:
-
-                    technique_id = str(
-                        item.get(
-                            "id",
-                            ""
-                        )
-                    )
-
-                    technique_name = str(
-                        item.get(
-                            "name",
-                            "Unknown"
-                        )
-                    )
-
-                    with st.expander(
-                        technique_id
-                        + " — "
-                        + technique_name
-                    ):
-
-                        st.write(
-                            item.get(
-                                "description",
-                                "No description available."
-                            )
-                        )
-
-
-# ============================================================
-# TAB 5 - INVESTIGATION
-# ============================================================
-
-with investigation_tab:
-
-    st.header(
-        "🛡️ Investigation Workspace"
-    )
-
-    result = st.session_state.last_alert
-
-    if result is None:
-
-        st.info(
-            "Analyze an alert in the Alert Triage tab first."
+        st.error(
+            "MITRE ATT&CK data was not found."
         )
 
     else:
 
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Risk",
-            str(
-                result["risk"]
+        query = st.text_input(
+            "Search MITRE ATT&CK",
+            placeholder=(
+                "Example: PowerShell, "
+                "credential dumping, scanning, T1059"
             )
-            + "/100"
         )
 
-        col2.metric(
-            "Severity",
-            result["severity"]
+        if query:
+
+            results = get_top3_mitre(
+                query
+            )
+
+            st.subheader(
+                "Top 3 Results"
+            )
+
+            for rank, item in enumerate(
+                results,
+                start=1
+            ):
+
+                st.markdown(
+                    f"""
+                    ### #{rank}
+                    {item['id']} —
+                    {item['name']}
+                    """
+                )
+
+                st.caption(
+                    f"Retrieval score: "
+                    f"{item['similarity']:.4f}"
+                )
+
+                st.write(
+                    item[
+                        "description"
+                    ]
+                )
+
+                if item[
+                    "phases"
+                ]:
+
+                    st.write(
+                        "**Tactics:** "
+                        +
+                        ", ".join(
+                            item[
+                                "phases"
+                            ]
+                        )
+                    )
+
+                st.divider()
+
+
+# ============================================================
+# SOC INVESTIGATION
+# ============================================================
+
+with soc_tab:
+
+    st.header(
+        "🛡️ SOC Investigation"
+    )
+
+    history = load_history()
+
+    if history.empty:
+
+        st.info(
+            "No investigation history available."
         )
 
-        col3.metric(
-            "MITRE Matches",
-            len(
-                result["mitre"]
-            )
+    else:
+
+        st.dataframe(
+            history,
+            use_container_width=True,
+            hide_index=True
         )
 
         st.subheader(
-            "Latest Alert"
+            "Severity Distribution"
         )
 
-        st.write(
-            result["alert"]
+        counts = (
+            history[
+                "severity"
+            ].value_counts()
+        )
+
+        st.bar_chart(
+            counts
+        )
+
+    if (
+        "latest_result"
+        in st.session_state
+    ):
+
+        st.divider()
+
+        report = build_report(
+
+            st.session_state[
+                "latest_result"
+            ],
+
+            st.session_state[
+                "latest_telemetry"
+            ],
+
+            st.session_state[
+                "latest_mitre"
+            ],
+
+            st.session_state[
+                "latest_verification"
+            ],
+
+            st.session_state[
+                "latest_recommendations"
+            ],
+
+            analyst_name,
+
+            st.session_state[
+                "latest_notes"
+            ]
         )
 
         st.subheader(
-            "Recommended Actions"
+            "Latest Security Report"
         )
 
-        for action in result["actions"]:
-
-            st.write(
-                "• "
-                + action
-            )
-
-        report = create_report(
-            result
+        st.text_area(
+            "Report",
+            report,
+            height=450
         )
 
         st.download_button(
-            "⬇️ Download Investigation Report",
+            "⬇️ Download Security Report",
             report,
-            result["incident_id"]
-            + "_investigation.txt",
-            "text/plain"
+            "triagemind_security_report.txt",
+            "text/plain",
+            use_container_width=True
+        )
+
+        # Download individual Top-3 descriptions.
+
+        for rank, item in enumerate(
+            st.session_state[
+                "latest_mitre"
+            ][:3],
+            start=1
+        ):
+
+            description = (
+
+                f"Rank #{rank}\n\n"
+
+                f"{item['id']} - "
+                f"{item['name']}\n\n"
+
+                f"{item['description']}\n\n"
+
+                f"Tactics: "
+                +
+                ", ".join(
+                    item[
+                        "phases"
+                    ]
+                )
+            )
+
+            st.download_button(
+                f"⬇️ Download #{rank} "
+                f"{item['id']} Description",
+
+                description,
+
+                f"{item['id']}_description.txt",
+
+                "text/plain"
+            )
+
+
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
+
+with diagnostics_tab:
+
+    st.header(
+        "⚙️ Diagnostics"
+    )
+
+    status = pd.DataFrame(
+        [
+            {
+                "Component":
+                    "ML Classifier",
+
+                "Status":
+                    (
+                        "Loaded"
+                        if classifier is not None
+                        else "Missing"
+                    )
+            },
+
+            {
+                "Component":
+                    "Feature Columns",
+
+                "Status":
+                    (
+                        f"{len(feature_columns)} loaded"
+                        if feature_columns
+                        else "Missing"
+                    )
+            },
+
+            {
+                "Component":
+                    "MITRE ATT&CK",
+
+                "Status":
+                    (
+                        f"{len(MITRE_TECHNIQUES)} techniques"
+                        if MITRE_TECHNIQUES
+                        else "Missing"
+                    )
+            },
+
+            {
+                "Component":
+                    "SQLite",
+
+                "Status":
+                    "Enabled"
+            },
+
+            {
+                "Component":
+                    "Top-3 Retrieval",
+
+                "Status":
+                    "Enabled"
+            },
+
+            {
+                "Component":
+                    "Input Sanitization",
+
+                "Status":
+                    "Enabled"
+            },
+
+            {
+                "Component":
+                    "MITRE ID Verification",
+
+                "Status":
+                    "Enabled"
+            }
+        ]
+    )
+
+    st.dataframe(
+        status,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.divider()
+
+    st.subheader(
+        "Model Information"
+    )
+
+    if classifier is not None:
+
+        st.write(
+            "Model:",
+            type(
+                classifier
+            ).__name__
+        )
+
+        st.write(
+            "Number of features:",
+            len(
+                feature_columns
+            )
+        )
+
+        with st.expander(
+            "View feature columns"
+        ):
+
+            st.code(
+                "\n".join(
+                    feature_columns
+                )
+            )
+
+    else:
+
+        st.error(
+            model_error
         )
 
     st.divider()
 
     st.subheader(
-        "Investigation History"
+        "MITRE Citation Verification Test"
     )
 
-    if st.session_state.history:
+    test_ids = st.text_input(
+        "Enter MITRE IDs separated by commas",
+        "T1059,T1003,T9999"
+    )
 
-        history_df = pd.DataFrame(
-            st.session_state.history
-        )
+    if st.button(
+        "Verify IDs"
+    ):
 
-        st.dataframe(
-            history_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        history_csv = (
-            history_df
-            .to_csv(
-                index=False
+        ids = [
+            item.strip()
+            for item in test_ids.split(
+                ","
             )
-            .encode(
-                "utf-8"
+            if item.strip()
+        ]
+
+        verification = (
+            verify_mitre_ids(
+                ids
             )
         )
 
-        st.download_button(
-            "⬇️ Download History",
-            history_csv,
-            "triagemind_history.csv",
-            "text/csv"
+        a, b, c = st.columns(3)
+
+        a.metric(
+            "Verified",
+            len(
+                verification[
+                    "verified"
+                ]
+            )
         )
 
-    else:
+        b.metric(
+            "Invalid",
+            len(
+                verification[
+                    "fabricated"
+                ]
+            )
+        )
 
-        st.info(
-            "No investigation history yet."
+        c.metric(
+            "Fabricated-ID Rate",
+            f"{verification['fabricated_rate'] * 100:.2f}%"
+        )
+
+        st.write(
+            "Verified:",
+            verification[
+                "verified"
+            ]
+        )
+
+        st.write(
+            "Invalid:",
+            verification[
+                "fabricated"
+            ]
         )
 
 
@@ -1708,7 +2662,7 @@ with investigation_tab:
 st.divider()
 
 st.caption(
-    "TriageMind AI • Machine Learning • "
-    "Network Detection • MITRE ATT&CK • "
-    "SOC Alert Triage"
+    "TriageMind AI | ML Network Detection | "
+    "MITRE ATT&CK Top-3 Retrieval | "
+    "SOC Investigation"
 )
