@@ -1,8 +1,13 @@
 import os
-import pandas as pd
+import json
+import pickle
+import uuid
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
 import streamlit as st
-import joblib
+
 
 # ============================================================
 # PAGE CONFIG
@@ -11,9 +16,30 @@ import joblib
 st.set_page_config(
     page_title="TriageMind AI",
     page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MODEL_DIR = os.path.join(BASE_DIR, "model")
+MITRE_DIR = os.path.join(BASE_DIR, "mitre_data")
+DATASET_DIR = os.path.join(BASE_DIR, "dataset")
+
+CLASSIFIER_PATH = os.path.join(
+    MODEL_DIR,
+    "classifier.pkl"
+)
+
+FEATURE_PATH = os.path.join(
+    MODEL_DIR,
+    "feature_columns.pkl"
+)
+
 
 # ============================================================
 # SESSION STATE
@@ -22,8 +48,643 @@ st.set_page_config(
 if "history" not in st.session_state:
     st.session_state.history = []
 
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+
+
 # ============================================================
-# TAB CREATION
+# CSS
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+
+    .main {
+        background-color: #0b1120;
+    }
+
+    .hero {
+        padding: 25px;
+        border-radius: 18px;
+        background: linear-gradient(
+            135deg,
+            #111827,
+            #172554
+        );
+        border: 1px solid #334155;
+        margin-bottom: 20px;
+    }
+
+    .hero h1 {
+        color: white;
+        font-size: 40px;
+        margin-bottom: 5px;
+    }
+
+    .hero p {
+        color: #cbd5e1;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
+
+@st.cache_resource
+def load_model():
+
+    if not os.path.exists(CLASSIFIER_PATH):
+        return None
+
+    try:
+
+        with open(
+            CLASSIFIER_PATH,
+            "rb"
+        ) as f:
+
+            return pickle.load(f)
+
+    except Exception:
+
+        return None
+
+
+MODEL = load_model()
+
+
+# ============================================================
+# LOAD FEATURE COLUMNS
+# ============================================================
+
+@st.cache_resource
+def load_features():
+
+    if not os.path.exists(FEATURE_PATH):
+        return []
+
+    try:
+
+        with open(
+            FEATURE_PATH,
+            "rb"
+        ) as f:
+
+            data = pickle.load(f)
+
+        if isinstance(data, pd.DataFrame):
+
+            return list(data.columns)
+
+        if isinstance(data, np.ndarray):
+
+            return list(data)
+
+        return list(data)
+
+    except Exception:
+
+        return []
+
+
+FEATURE_COLUMNS = load_features()
+
+
+# ============================================================
+# LOAD MITRE ATT&CK
+# ============================================================
+
+@st.cache_data
+def load_mitre():
+
+    filenames = [
+        "enterprise-attack.json",
+        "enterprise-attack-19.2.json",
+        "mitre_techniques.json"
+    ]
+
+    for filename in filenames:
+
+        path = os.path.join(
+            MITRE_DIR,
+            filename
+        )
+
+        if not os.path.exists(path):
+            continue
+
+        try:
+
+            with open(
+                path,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                data = json.load(f)
+
+            if isinstance(data, dict):
+
+                if "objects" in data:
+                    return data["objects"]
+
+                if "techniques" in data:
+                    return data["techniques"]
+
+            if isinstance(data, list):
+                return data
+
+        except Exception:
+
+            return []
+
+    return []
+
+
+MITRE_DATA = load_mitre()
+
+
+# ============================================================
+# MITRE SEARCH
+# ============================================================
+
+def search_mitre(query):
+
+    if not MITRE_DATA:
+        return []
+
+    query = query.lower()
+
+    results = []
+
+    for item in MITRE_DATA:
+
+        if not isinstance(item, dict):
+            continue
+
+        name = str(
+            item.get(
+                "name",
+                ""
+            )
+        )
+
+        description = str(
+            item.get(
+                "description",
+                ""
+            )
+        )
+
+        technique_id = ""
+
+        references = item.get(
+            "external_references",
+            []
+        )
+
+        for reference in references:
+
+            if not isinstance(
+                reference,
+                dict
+            ):
+                continue
+
+            if reference.get(
+                "source_name"
+            ) == "mitre-attack":
+
+                technique_id = str(
+                    reference.get(
+                        "external_id",
+                        ""
+                    )
+                )
+
+                break
+
+        combined = (
+            name
+            + " "
+            + description
+            + " "
+            + technique_id
+        ).lower()
+
+        if query in combined:
+
+            results.append(
+                {
+                    "id": technique_id,
+                    "name": name,
+                    "description": description
+                }
+            )
+
+    return results[:10]
+
+
+# ============================================================
+# ALERT → MITRE
+# ============================================================
+
+def map_alert_to_mitre(alert):
+
+    keywords = [
+        "phishing",
+        "powershell",
+        "credential",
+        "brute force",
+        "failed login",
+        "remote desktop",
+        "rdp",
+        "ssh",
+        "scheduled task",
+        "command",
+        "script",
+        "exfiltration",
+        "ransomware",
+        "malware"
+    ]
+
+    results = []
+
+    text = alert.lower()
+
+    for keyword in keywords:
+
+        if keyword in text:
+
+            matches = search_mitre(
+                keyword
+            )
+
+            results.extend(
+                matches
+            )
+
+    unique = {}
+
+    for result in results:
+
+        key = (
+            result["id"]
+            + result["name"]
+        )
+
+        unique[key] = result
+
+    return list(
+        unique.values()
+    )[:10]
+
+
+# ============================================================
+# ATTACK DESCRIPTION
+# ============================================================
+
+ATTACK_DESCRIPTIONS = {
+
+    "Brute Force":
+        (
+            "A brute-force attack attempts to gain access "
+            "to an account or service by repeatedly trying "
+            "different authentication values."
+        ),
+
+    "Credential Attack":
+        (
+            "A credential attack attempts to obtain, guess "
+            "or abuse usernames, passwords or authentication "
+            "tokens."
+        ),
+
+    "Phishing":
+        (
+            "Phishing uses deceptive emails, messages, "
+            "websites or attachments to trick users into "
+            "revealing information or executing malicious "
+            "content."
+        ),
+
+    "PowerShell / Command Execution":
+        (
+            "PowerShell and command execution can be used "
+            "for legitimate administration but may also "
+            "appear during malicious activity."
+        ),
+
+    "Malware":
+        (
+            "Malware is software designed to perform "
+            "unauthorized or harmful actions on a system."
+        ),
+
+    "Data Exfiltration":
+        (
+            "Data exfiltration involves unauthorized "
+            "transfer of information from an environment "
+            "to an external location."
+        ),
+
+    "Remote Access":
+        (
+            "Remote access involves connecting to systems "
+            "using services such as RDP or SSH. Unexpected "
+            "remote access should be investigated."
+        ),
+
+    "Suspicious Activity":
+        (
+            "The alert contains suspicious indicators but "
+            "does not provide enough information to classify "
+            "a specific attack type."
+        )
+}
+
+
+# ============================================================
+# DETECT ATTACK TYPE
+# ============================================================
+
+def detect_attack(alert):
+
+    text = alert.lower()
+
+    categories = {
+
+        "Brute Force": [
+            "brute force",
+            "failed login",
+            "password guessing",
+            "multiple login"
+        ],
+
+        "Credential Attack": [
+            "credential",
+            "password",
+            "credential dumping"
+        ],
+
+        "Phishing": [
+            "phishing",
+            "malicious email",
+            "suspicious email"
+        ],
+
+        "PowerShell / Command Execution": [
+            "powershell",
+            "command execution",
+            "script",
+            "cmd.exe"
+        ],
+
+        "Malware": [
+            "malware",
+            "trojan",
+            "ransomware",
+            "malicious file"
+        ],
+
+        "Data Exfiltration": [
+            "exfiltration",
+            "data theft",
+            "stolen data"
+        ],
+
+        "Remote Access": [
+            "rdp",
+            "remote desktop",
+            "ssh",
+            "remote access"
+        ]
+    }
+
+    matched = []
+
+    for category, keywords in categories.items():
+
+        for keyword in keywords:
+
+            if keyword in text:
+
+                matched.append(
+                    keyword
+                )
+
+                return category, matched
+
+    return "Suspicious Activity", matched
+
+
+# ============================================================
+# RISK
+# ============================================================
+
+def calculate_risk(
+    attack_type,
+    alert
+):
+
+    risk = 20
+
+    if attack_type != "Suspicious Activity":
+        risk += 30
+
+    high_risk_words = [
+        "ransomware",
+        "exfiltration",
+        "credential dumping",
+        "successful login",
+        "privilege escalation",
+        "malware"
+    ]
+
+    for word in high_risk_words:
+
+        if word in alert.lower():
+
+            risk += 10
+
+    return min(
+        risk,
+        95
+    )
+
+
+# ============================================================
+# SEVERITY
+# ============================================================
+
+def get_severity(risk):
+
+    if risk >= 85:
+        return "CRITICAL"
+
+    if risk >= 65:
+        return "HIGH"
+
+    if risk >= 35:
+        return "MEDIUM"
+
+    return "LOW"
+
+
+# ============================================================
+# RECOMMENDED ACTIONS
+# ============================================================
+
+def recommended_actions(
+    attack_type
+):
+
+    actions = {
+
+        "Brute Force": [
+            "Review authentication logs.",
+            "Check whether the source IP is known.",
+            "Investigate successful authentication events.",
+            "Consider account protection measures."
+        ],
+
+        "Credential Attack": [
+            "Review account authentication history.",
+            "Check for credential misuse.",
+            "Inspect endpoint activity.",
+            "Investigate unusual login locations."
+        ],
+
+        "Phishing": [
+            "Inspect the original email.",
+            "Analyze URLs and attachments.",
+            "Check other recipients.",
+            "Inspect affected endpoints."
+        ],
+
+        "PowerShell / Command Execution": [
+            "Review PowerShell command lines.",
+            "Inspect parent-child processes.",
+            "Review endpoint telemetry.",
+            "Check for persistence."
+        ],
+
+        "Malware": [
+            "Isolate the affected endpoint if appropriate.",
+            "Review suspicious processes.",
+            "Inspect files and persistence.",
+            "Check related network connections."
+        ],
+
+        "Data Exfiltration": [
+            "Identify transferred data.",
+            "Review destination infrastructure.",
+            "Check transfer volume and timing.",
+            "Investigate affected accounts and hosts."
+        ],
+
+        "Remote Access": [
+            "Review remote authentication logs.",
+            "Verify the source IP.",
+            "Check whether remote access was authorized.",
+            "Inspect endpoint activity."
+        ],
+
+        "Suspicious Activity": [
+            "Review the alert in additional telemetry.",
+            "Identify source and destination systems.",
+            "Check related events.",
+            "Document analyst findings."
+        ]
+    }
+
+    return actions.get(
+        attack_type,
+        actions["Suspicious Activity"]
+    )
+
+
+# ============================================================
+# HERO
+# ============================================================
+
+st.markdown(
+    """
+    <div class="hero">
+
+        <h1>🛡️ TriageMind AI</h1>
+
+        <p>
+        Intelligent Cybersecurity Alert Triage Platform
+        </p>
+
+        <p>
+        ML Detection • Risk Scoring • MITRE ATT&CK •
+        SOC Investigation
+        </p>
+
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.title("🛡️ TriageMind")
+
+    st.divider()
+
+    if MODEL:
+
+        st.success(
+            "ML Model: READY"
+        )
+
+    else:
+
+        st.error(
+            "ML Model: NOT FOUND"
+        )
+
+    if FEATURE_COLUMNS:
+
+        st.success(
+            f"Features: {len(FEATURE_COLUMNS)}"
+        )
+
+    else:
+
+        st.error(
+            "Feature file missing"
+        )
+
+    if MITRE_DATA:
+
+        st.success(
+            f"MITRE: {len(MITRE_DATA)} objects"
+        )
+
+    else:
+
+        st.warning(
+            "MITRE data unavailable"
+        )
+
+
+# ============================================================
+# IMPORTANT:
+# DEFINE ALL TABS BEFORE USING THEM
 # ============================================================
 
 dashboard_tab, triage_tab, network_tab, mitre_tab, soc_tab, diagnostics_tab = st.tabs(
@@ -37,543 +698,756 @@ dashboard_tab, triage_tab, network_tab, mitre_tab, soc_tab, diagnostics_tab = st
     ]
 )
 
-# ============================================================
-# BASIC PATHS
-# ============================================================
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-MODEL_DIR = os.path.join(BASE_DIR, "model")
-MITRE_DIR = os.path.join(BASE_DIR, "mitre_data")
-
-CLASSIFIER_PATH = os.path.join(
-    MODEL_DIR,
-    "classifier.pkl"
-)
-
-FEATURE_PATH = os.path.join(
-    MODEL_DIR,
-    "feature_columns.pkl"
-)
 
 # ============================================================
-# LOAD MODEL
-# ============================================================
-
-MODEL = None
-FEATURE_COLUMNS = []
-
-try:
-    if os.path.exists(CLASSIFIER_PATH):
-        MODEL = joblib.load(CLASSIFIER_PATH)
-
-    if os.path.exists(FEATURE_PATH):
-        FEATURE_COLUMNS = joblib.load(FEATURE_PATH)
-
-except Exception as e:
-    st.warning(f"Model loading issue: {e}")
-
-# ============================================================
-# LOAD MITRE DATA
-# ============================================================
-
-MITRE_TECHNIQUES = []
-
-MITRE_FILES = [
-    "enterprise-attack-19.2.json",
-    "enterprise-attack.json",
-    "mitre_techniques.json"
-]
-
-for filename in MITRE_FILES:
-
-    path = os.path.join(
-        MITRE_DIR,
-        filename
-    )
-
-    if os.path.exists(path):
-
-        try:
-
-            if filename.endswith(".json"):
-
-                import json
-
-                with open(
-                    path,
-                    "r",
-                    encoding="utf-8"
-                ) as f:
-
-                    mitre_data = json.load(f)
-
-                if isinstance(mitre_data, dict):
-
-                    if "objects" in mitre_data:
-
-                        MITRE_TECHNIQUES = mitre_data["objects"]
-
-                    elif "techniques" in mitre_data:
-
-                        MITRE_TECHNIQUES = mitre_data["techniques"]
-
-                    else:
-
-                        MITRE_TECHNIQUES = []
-
-                elif isinstance(mitre_data, list):
-
-                    MITRE_TECHNIQUES = mitre_data
-
-                break
-
-        except Exception:
-            continue
-
-# ============================================================
-# OPTIONAL FAISS PATH
-# ============================================================
-
-FAISS_PATH = None
-
-possible_faiss = [
-    os.path.join(
-        MITRE_DIR,
-        "mitre_index.faiss"
-    ),
-    os.path.join(
-        BASE_DIR,
-        "faiss_index",
-        "mitre_index.faiss"
-    ),
-    os.path.join(
-        BASE_DIR,
-        "faiss_index",
-        "index.faiss"
-    )
-]
-
-for path in possible_faiss:
-
-    if os.path.exists(path):
-
-        FAISS_PATH = path
-        break
-
-# ============================================================
-# FEATURE IMPORTANCE HELPER
-# ============================================================
-
-def get_feature_importance():
-
-    try:
-
-        if MODEL is None:
-            return None
-
-        if not hasattr(
-            MODEL,
-            "feature_importances_"
-        ):
-            return None
-
-        importance = MODEL.feature_importances_
-
-        if FEATURE_COLUMNS:
-
-            names = FEATURE_COLUMNS
-
-        else:
-
-            names = [
-                f"Feature {i + 1}"
-                for i in range(len(importance))
-            ]
-
-        n = min(
-            len(names),
-            len(importance)
-        )
-
-        df = pd.DataFrame(
-            {
-                "Feature": names[:n],
-                "Importance": importance[:n]
-            }
-        )
-
-        return df.sort_values(
-            "Importance",
-            ascending=False
-        )
-
-    except Exception:
-        return None
-
-
-# ============================================================
-# DASHBOARD
+# DASHBOARD TAB
 # ============================================================
 
 with dashboard_tab:
 
-    st.markdown(
-        """
-        <div style="
-            padding:30px;
-            border-radius:20px;
-            background:linear-gradient(
-                135deg,
-                #0f172a,
-                #172554,
-                #111827
-            );
-            border:1px solid #334155;
-            margin-bottom:25px;
-        ">
-
-        <div style="
-            color:#60a5fa;
-            font-weight:600;
-            letter-spacing:1px;
-        ">
-        SECURITY OPERATIONS CENTER
-        </div>
-
-        <h1 style="
-            color:white;
-            font-size:42px;
-            margin:8px 0;
-        ">
-        🛡️ TriageMind AI
-        </h1>
-
-        <p style="
-            color:#cbd5e1;
-            font-size:18px;
-        ">
-        Intelligent Cybersecurity Alert Triage Platform
-        </p>
-
-        <p style="
-            color:#94a3b8;
-        ">
-        Machine Learning • MITRE ATT&CK •
-        Explainable AI • SOC Investigation
-        </p>
-
-        </div>
-        """,
-        unsafe_allow_html=True
+    st.header(
+        "🏠 Security Dashboard"
     )
-
-    st.subheader("🟢 System Overview")
 
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
 
-        if MODEL is not None:
-
-            st.success("ML ENGINE ONLINE")
-
-            st.metric(
-                "Classifier",
-                type(MODEL).__name__
+        st.metric(
+            "Investigations",
+            len(
+                st.session_state.history
             )
-
-        else:
-
-            st.error("ML ENGINE OFFLINE")
-
-            st.metric(
-                "Classifier",
-                "Unavailable"
-            )
+        )
 
     with c2:
 
-        if MITRE_TECHNIQUES:
-
-            st.success("MITRE ONLINE")
-
-            st.metric(
-                "Techniques",
-                len(MITRE_TECHNIQUES)
-            )
-
-        else:
-
-            st.warning("MITRE DATA NOT FOUND")
-
-            st.metric(
-                "Techniques",
-                0
-            )
+        st.metric(
+            "MITRE Objects",
+            len(MITRE_DATA)
+        )
 
     with c3:
 
-        st.success("FEATURES READY")
-
         st.metric(
-            "Features",
+            "ML Features",
             len(FEATURE_COLUMNS)
         )
 
     with c4:
 
-        st.info("CASE HISTORY")
-
         st.metric(
-            "Investigations",
-            len(st.session_state.history)
+            "ML Status",
+            "ONLINE"
+            if MODEL
+            else "OFFLINE"
         )
 
     st.divider()
 
-    st.subheader("📊 Security Operations Summary")
-
-    if st.session_state.history:
-
-        history_df = pd.DataFrame(
-            st.session_state.history
-        )
-
-        if "Risk Score" in history_df.columns:
-
-            risk = pd.to_numeric(
-                history_df["Risk Score"],
-                errors="coerce"
-            ).fillna(0)
-
-            avg_risk = risk.mean()
-
-        else:
-
-            avg_risk = 0
-
-        if "Severity" in history_df.columns:
-
-            high_count = history_df[
-                history_df["Severity"].isin(
-                    ["HIGH", "CRITICAL"]
-                )
-            ].shape[0]
-
-            latest = history_df.iloc[-1][
-                "Severity"
-            ]
-
-        else:
-
-            high_count = 0
-            latest = "N/A"
-
-    else:
-
-        avg_risk = 0
-        high_count = 0
-        latest = "No alerts"
+    st.subheader(
+        "How TriageMind Works"
+    )
 
     a, b, c, d = st.columns(4)
 
     with a:
-        st.metric(
-            "Investigations",
-            len(st.session_state.history)
+
+        st.info(
+            "1\n\n"
+            "Alert / Network Data"
         )
 
     with b:
-        st.metric(
-            "Average Risk",
-            f"{avg_risk:.1f}/100"
+
+        st.info(
+            "2\n\n"
+            "ML Detection"
         )
 
     with c:
-        st.metric(
-            "High / Critical",
-            high_count
+
+        st.info(
+            "3\n\n"
+            "MITRE Enrichment"
         )
 
     with d:
-        st.metric(
-            "Latest Severity",
-            latest
+
+        st.info(
+            "4\n\n"
+            "SOC Investigation"
         )
 
-    st.divider()
 
-    st.subheader("🚀 Security Workflow")
+# ============================================================
+# TRIAGE TAB
+# ============================================================
 
-    w1, w2, w3, w4 = st.columns(4)
+with triage_tab:
 
-    with w1:
-        st.markdown(
-            """
-            ### 01 🚨 Detect
-
-            Upload network traffic or
-            provide a security alert.
-            """
-        )
-
-    with w2:
-        st.markdown(
-            """
-            ### 02 🔎 Triage
-
-            Analyze suspicious activity
-            using the ML classifier.
-            """
-        )
-
-    with w3:
-        st.markdown(
-            """
-            ### 03 🎯 Map
-
-            Connect observed behavior
-            with MITRE ATT&CK.
-            """
-        )
-
-    with w4:
-        st.markdown(
-            """
-            ### 04 🛡️ Investigate
-
-            Review evidence and generate
-            a SOC investigation report.
-            """
-        )
-
-    st.divider()
-
-    st.subheader("🏗️ TriageMind Architecture")
-
-    st.code(
-        """
-SECURITY ALERT
-      │
-      ▼
-┌─────────────────┐
-│  TRIAGEMIND AI  │
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    ▼         ▼
- ML ENGINE  MITRE ATT&CK
-    │         │
-    ▼         ▼
-Attack      Technique
-Detection   Mapping
-    │         │
-    └────┬────┘
-         ▼
-    RISK ENGINE
-         │
-         ▼
- SOC INVESTIGATION
-         │
-    ┌────┴────┐
-    ▼         ▼
- REPORT    ANALYTICS
-        """,
-        language="text"
+    st.header(
+        "🚨 Alert Triage"
     )
 
-    st.divider()
+    st.write(
+        "Enter security information below."
+    )
 
-    st.subheader("🧠 Platform Capabilities")
+    with st.form(
+        "triage_form"
+    ):
 
-    p1, p2, p3 = st.columns(3)
-
-    with p1:
-
-        st.markdown(
-            """
-            ### 🤖 Machine Learning
-
-            • Network intrusion detection  
-            • Attack classification  
-            • Confidence analysis  
-            • Feature importance  
-            • Model evaluation
-            """
+        alert = st.text_area(
+            "Security Alert",
+            height=160,
+            placeholder=(
+                "Example: Multiple failed login "
+                "attempts followed by a successful "
+                "login from an external IP."
+            )
         )
 
-    with p2:
+        col1, col2 = st.columns(2)
 
-        st.markdown(
-            """
-            ### 🎯 Threat Intelligence
+        with col1:
 
-            • MITRE ATT&CK  
-            • Technique identification  
-            • Tactic mapping  
-            • Alert enrichment  
-            • Threat context
-            """
+            source_ip = st.text_input(
+                "Source IP"
+            )
+
+        with col2:
+
+            destination_ip = st.text_input(
+                "Destination IP"
+            )
+
+        notes = st.text_area(
+            "Analyst Notes"
         )
 
-    with p3:
-
-        st.markdown(
-            """
-            ### 🛡️ SOC Operations
-
-            • Alert triage  
-            • Risk scoring  
-            • Investigation workflow  
-            • Security reports  
-            • Investigation history
-            """
+        submit = st.form_submit_button(
+            "🔍 Analyze Alert",
+            type="primary",
+            use_container_width=True
         )
 
-    st.divider()
+    if submit:
 
-    st.subheader("🔄 Detection Pipeline")
+        if not alert.strip():
 
-    pipeline = pd.DataFrame(
-        {
-            "Stage": [
-                "1. Input",
-                "2. ML Analysis",
-                "3. MITRE Mapping",
-                "4. Risk Analysis",
-                "5. Investigation",
-                "6. Reporting"
-            ],
-            "Purpose": [
-                "Security alert or network CSV",
-                "Classify suspicious activity",
-                "Identify ATT&CK techniques",
-                "Calculate security risk",
-                "Guide analyst investigation",
-                "Generate security report"
+            st.warning(
+                "Please enter a security alert."
+            )
+
+        else:
+
+            incident_id = (
+                "TM-"
+                + datetime.now().strftime(
+                    "%Y%m%d"
+                )
+                + "-"
+                + uuid.uuid4().hex[:6].upper()
+            )
+
+            attack_type, keywords = detect_attack(
+                alert
+            )
+
+            description = ATTACK_DESCRIPTIONS[
+                attack_type
             ]
-        }
+
+            risk = calculate_risk(
+                attack_type,
+                alert
+            )
+
+            severity = get_severity(
+                risk
+            )
+
+            mitre_results = map_alert_to_mitre(
+                alert
+            )
+
+            actions = recommended_actions(
+                attack_type
+            )
+
+            case = {
+
+                "Incident ID":
+                    incident_id,
+
+                "Time":
+                    datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+
+                "Attack Type":
+                    attack_type,
+
+                "Risk":
+                    risk,
+
+                "Severity":
+                    severity,
+
+                "MITRE Matches":
+                    len(mitre_results)
+            }
+
+            st.session_state.history.append(
+                case
+            )
+
+            st.session_state.last_result = {
+
+                "incident_id":
+                    incident_id,
+
+                "alert":
+                    alert,
+
+                "source_ip":
+                    source_ip,
+
+                "destination_ip":
+                    destination_ip,
+
+                "notes":
+                    notes,
+
+                "attack_type":
+                    attack_type,
+
+                "description":
+                    description,
+
+                "risk":
+                    risk,
+
+                "severity":
+                    severity,
+
+                "mitre":
+                    mitre_results,
+
+                "actions":
+                    actions
+            }
+
+            st.success(
+                f"Incident {incident_id} created."
+            )
+
+            c1, c2, c3 = st.columns(3)
+
+            with c1:
+
+                st.metric(
+                    "Attack Type",
+                    attack_type
+                )
+
+            with c2:
+
+                st.metric(
+                    "Risk",
+                    f"{risk}/100"
+                )
+
+            with c3:
+
+                st.metric(
+                    "Severity",
+                    severity
+                )
+
+            st.divider()
+
+            # ------------------------------------------------
+            # DESCRIPTION
+            # ------------------------------------------------
+
+            st.subheader(
+                "📖 Attack Description"
+            )
+
+            st.info(
+                description
+            )
+
+            if keywords:
+
+                st.write(
+                    "**Detected indicators:**"
+                )
+
+                st.write(
+                    ", ".join(
+                        keywords
+                    )
+                )
+
+            # ------------------------------------------------
+            # DOWNLOAD DESCRIPTION
+            # ------------------------------------------------
+
+            report = f"""
+TRIAGEMIND AI
+ATTACK DESCRIPTION REPORT
+====================================
+
+Incident ID:
+{incident_id}
+
+Attack Type:
+{attack_type}
+
+Risk Score:
+{risk}/100
+
+Severity:
+{severity}
+
+Source IP:
+{source_ip if source_ip else "Not provided"}
+
+Destination IP:
+{destination_ip if destination_ip else "Not provided"}
+
+------------------------------------
+ATTACK DESCRIPTION
+------------------------------------
+
+{description}
+
+------------------------------------
+DETECTED INDICATORS
+------------------------------------
+
+{", ".join(keywords) if keywords else "None"}
+
+------------------------------------
+MITRE ATT&CK
+------------------------------------
+
+"""
+
+            if mitre_results:
+
+                for item in mitre_results:
+
+                    report += (
+                        f"{item['id']} - "
+                        f"{item['name']}\n"
+                    )
+
+            else:
+
+                report += (
+                    "No automatic MITRE mapping found.\n"
+                )
+
+            report += """
+
+------------------------------------
+RECOMMENDED ACTIONS
+------------------------------------
+
+"""
+
+            for action in actions:
+
+                report += (
+                    "• "
+                    + action
+                    + "\n"
+                )
+
+            report += """
+
+------------------------------------
+ANALYST NOTES
+------------------------------------
+
+"""
+
+            report += (
+                notes
+                if notes
+                else "No analyst notes."
+            )
+
+            st.download_button(
+                "⬇️ Download Attack Description",
+                report,
+                f"{incident_id}_attack_report.txt",
+                "text/plain",
+                use_container_width=True
+            )
+
+            # ------------------------------------------------
+            # MITRE
+            # ------------------------------------------------
+
+            st.subheader(
+                "🎯 MITRE ATT&CK Mapping"
+            )
+
+            if mitre_results:
+
+                for item in mitre_results:
+
+                    with st.expander(
+                        f"{item['id']} - "
+                        f"{item['name']}"
+                    ):
+
+                        st.write(
+                            item["description"]
+                        )
+
+            else:
+
+                st.info(
+                    "No automatic MITRE mapping found."
+                )
+
+            # ------------------------------------------------
+            # ACTIONS
+            # ------------------------------------------------
+
+            st.subheader(
+                "🛠️ Recommended Actions"
+            )
+
+            for action in actions:
+
+                st.write(
+                    "• " + action
+                )
+
+
+# ============================================================
+# NETWORK DETECTION
+# ============================================================
+
+with network_tab:
+
+    st.header(
+        "📊 Network ML Detection"
     )
 
-    st.dataframe(
-        pipeline,
-        use_container_width=True,
-        hide_index=True
+    st.write(
+        "Upload network traffic data for prediction "
+        "using your trained classifier."
     )
+
+    uploaded = st.file_uploader(
+        "Upload CSV",
+        type=["csv"]
+    )
+
+    if uploaded:
+
+        try:
+
+            df = pd.read_csv(
+                uploaded
+            )
+
+            st.success(
+                f"{len(df)} records loaded."
+            )
+
+            st.dataframe(
+                df.head(20),
+                use_container_width=True
+            )
+
+            if MODEL and FEATURE_COLUMNS:
+
+                missing = [
+                    col
+                    for col in FEATURE_COLUMNS
+                    if col not in df.columns
+                ]
+
+                if missing:
+
+                    st.warning(
+                        f"{len(missing)} model features "
+                        "are missing from the uploaded CSV."
+                    )
+
+                    with st.expander(
+                        "View missing features"
+                    ):
+
+                        st.write(
+                            missing
+                        )
+
+                if st.button(
+                    "🤖 Run ML Detection",
+                    type="primary"
+                ):
+
+                    prediction_df = df.copy()
+
+                    for col in FEATURE_COLUMNS:
+
+                        if col not in prediction_df.columns:
+
+                            prediction_df[col] = 0
+
+                    prediction_df = prediction_df[
+                        FEATURE_COLUMNS
+                    ]
+
+                    for col in prediction_df.columns:
+
+                        if prediction_df[
+                            col
+                        ].dtype == "object":
+
+                            prediction_df[
+                                col
+                            ] = (
+                                prediction_df[
+                                    col
+                                ]
+                                .astype("category")
+                                .cat.codes
+                            )
+
+                    prediction_df = (
+                        prediction_df
+                        .replace(
+                            [np.inf, -np.inf],
+                            np.nan
+                        )
+                        .fillna(0)
+                    )
+
+                    try:
+
+                        predictions = MODEL.predict(
+                            prediction_df
+                        )
+
+                        results = df.copy()
+
+                        results[
+                            "TriageMind Prediction"
+                        ] = predictions
+
+                        st.success(
+                            "Prediction completed."
+                        )
+
+                        st.dataframe(
+                            results,
+                            use_container_width=True
+                        )
+
+                        csv = results.to_csv(
+                            index=False
+                        ).encode(
+                            "utf-8"
+                        )
+
+                        st.download_button(
+                            "⬇️ Download Results",
+                            csv,
+                            "triagemind_results.csv",
+                            "text/csv"
+                        )
+
+                    except Exception as e:
+
+                        st.error(
+                            "Prediction failed."
+                        )
+
+                        st.code(
+                            str(e)
+                        )
+
+        except Exception as e:
+
+            st.error(
+                f"Could not read CSV: {e}"
+            )
+
+    else:
+
+        st.info(
+            "Upload a CSV containing network features."
+        )
+
+
+# ============================================================
+# MITRE TAB
+# ============================================================
+
+with mitre_tab:
+
+    st.header(
+        "🎯 MITRE ATT&CK Explorer"
+    )
+
+    query = st.text_input(
+        "Search MITRE ATT&CK",
+        placeholder="powershell, phishing, credential..."
+    )
+
+    if st.button(
+        "🔎 Search"
+    ):
+
+        if query:
+
+            results = search_mitre(
+                query
+            )
+
+            if results:
+
+                for result in results:
+
+                    with st.expander(
+                        f"{result['id']} - "
+                        f"{result['name']}"
+                    ):
+
+                        st.write(
+                            result["description"]
+                        )
+
+            else:
+
+                st.warning(
+                    "No matching technique found."
+                )
+
+        else:
+
+            st.warning(
+                "Enter a search term."
+            )
+
+
+# ============================================================
+# SOC TAB
+# ============================================================
+
+with soc_tab:
+
+    st.header(
+        "🛡️ SOC Investigation"
+    )
+
+    result = st.session_state.last_result
+
+    if result:
+
+        st.subheader(
+            result["incident_id"]
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+
+            st.metric(
+                "Attack",
+                result["attack_type"]
+            )
+
+        with c2:
+
+            st.metric(
+                "Risk",
+                f"{result['risk']}/100"
+            )
+
+        with c3:
+
+            st.metric(
+                "Severity",
+                result["severity"]
+            )
+
+        st.subheader(
+            "Alert"
+        )
+
+        st.write(
+            result["alert"]
+        )
+
+        st.subheader(
+            "Attack Description"
+        )
+
+        st.info(
+            result["description"]
+        )
+
+        st.subheader(
+            "Recommended Actions"
+        )
+
+        for action in result["actions"]:
+
+            st.write(
+                "• " + action
+            )
+
+        st.subheader(
+            "MITRE ATT&CK"
+        )
+
+        if result["mitre"]:
+
+            for item in result["mitre"]:
+
+                st.write(
+                    f"**{item['id']}** - "
+                    f"{item['name']}"
+                )
+
+        else:
+
+            st.info(
+                "No MITRE mapping."
+            )
+
+    else:
+
+        st.info(
+            "Run an alert investigation first."
+        )
 
     st.divider()
 
-    st.subheader("📋 Recent Investigations")
+    st.subheader(
+        "Investigation History"
+    )
 
     if st.session_state.history:
 
-        history_df = pd.DataFrame(
+        history = pd.DataFrame(
             st.session_state.history
         )
 
         st.dataframe(
-            history_df.tail(10).iloc[::-1],
+            history,
             use_container_width=True,
             hide_index=True
         )
@@ -581,110 +1455,122 @@ Detection   Mapping
     else:
 
         st.info(
-            "No investigations yet. "
-            "Start from the Alert Triage or "
-            "Network Detection tab."
+            "No investigations yet."
         )
 
-    st.divider()
 
-    st.subheader("🤖 Model Information")
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
 
-    m1, m2 = st.columns(2)
+with diagnostics_tab:
 
-    with m1:
+    st.header(
+        "⚙️ Diagnostics"
+    )
 
-        if MODEL is not None:
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.write(
+            "**Model:**"
+        )
+
+        if MODEL:
 
             st.success(
-                "Machine-learning model loaded successfully."
-            )
-
-            st.write(
-                "**Model:**",
-                type(MODEL).__name__
-            )
-
-            st.write(
-                "**Input Features:**",
-                len(FEATURE_COLUMNS)
+                "classifier.pkl loaded"
             )
 
         else:
 
             st.error(
-                "Machine-learning model could not be loaded."
+                "classifier.pkl missing"
             )
 
-    with m2:
+        st.write(
+            "**Feature file:**"
+        )
 
-        importance_df = get_feature_importance()
+        if FEATURE_COLUMNS:
 
-        if importance_df is not None:
-
-            st.write("**Top Model Features**")
-
-            chart_df = (
-                importance_df
-                .head(10)
-                .set_index("Feature")
-            )
-
-            st.bar_chart(
-                chart_df
+            st.success(
+                f"{len(FEATURE_COLUMNS)} features loaded"
             )
 
         else:
 
-            st.info(
-                "Feature importance is unavailable."
+            st.error(
+                "feature_columns.pkl missing"
             )
 
+    with col2:
+
+        st.write(
+            "**MITRE:**"
+        )
+
+        if MITRE_DATA:
+
+            st.success(
+                f"{len(MITRE_DATA)} objects loaded"
+            )
+
+        else:
+
+            st.error(
+                "MITRE data missing"
+            )
+
+        st.write(
+            "**Project directory:**"
+        )
+
+        st.code(
+            BASE_DIR
+        )
+
     st.divider()
 
-    st.subheader("🎯 MITRE ATT&CK Status")
-
-    if MITRE_TECHNIQUES:
-
-        st.success(
-            "MITRE ATT&CK knowledge base loaded."
-        )
-
-        st.metric(
-            "Available Techniques",
-            len(MITRE_TECHNIQUES)
-        )
-
-    else:
-
-        st.warning(
-            "MITRE ATT&CK data was not detected."
-        )
-
-    st.divider()
-
-    st.markdown(
-        """
-        <div style="
-            text-align:center;
-            padding:20px;
-            color:#94a3b8;
-        ">
-
-        <strong style="color:#60a5fa;">
-        TriageMind AI
-        </strong>
-
-        <br>
-
-        Intelligent Cybersecurity Alert Triage
-
-        <br><br>
-
-        Machine Learning • MITRE ATT&CK •
-        Explainable AI • SOC Automation
-
-        </div>
-        """,
-        unsafe_allow_html=True
+    st.subheader(
+        "Required Files"
     )
+
+    required_files = [
+
+        CLASSIFIER_PATH,
+
+        FEATURE_PATH,
+
+        os.path.join(
+            MITRE_DIR,
+            "enterprise-attack.json"
+        )
+    ]
+
+    for path in required_files:
+
+        if os.path.exists(path):
+
+            st.success(
+                "✓ " + path
+            )
+
+        else:
+
+            st.warning(
+                "Missing: " + path
+            )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "TriageMind AI | ML Detection | "
+    "MITRE ATT&CK | SOC Investigation"
+)
